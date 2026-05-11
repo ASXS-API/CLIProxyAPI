@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -11,6 +12,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 )
+
+var proxyTransportCache sync.Map // map[string]*http.Transport
 
 // NewProxyAwareHTTPClient creates an HTTP client with proper proxy configuration priority:
 // 1. Use auth.ProxyURL if configured (highest priority)
@@ -44,7 +47,14 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 
 	// If we have a proxy URL configured, set up the transport
 	if proxyURL != "" {
-		transport := buildProxyTransport(proxyURL)
+		if auth != nil && strings.TrimSpace(auth.ProxyURL) == proxyURL {
+			if rt := roundTripperFromContext(ctx); rt != nil {
+				httpClient.Transport = rt
+				return httpClient
+			}
+		}
+
+		transport := cachedProxyTransport(proxyURL)
 		if transport != nil {
 			httpClient.Transport = transport
 			return httpClient
@@ -54,11 +64,38 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	}
 
 	// Priority 3: Use RoundTripper from context (typically from RoundTripperFor)
-	if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
+	if rt := roundTripperFromContext(ctx); rt != nil {
 		httpClient.Transport = rt
 	}
 
 	return httpClient
+}
+
+func roundTripperFromContext(ctx context.Context) http.RoundTripper {
+	if ctx == nil {
+		return nil
+	}
+	if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
+		return rt
+	}
+	return nil
+}
+
+func cachedProxyTransport(proxyURL string) *http.Transport {
+	if transport, ok := proxyTransportCache.Load(proxyURL); ok {
+		return transport.(*http.Transport)
+	}
+
+	transport := buildProxyTransport(proxyURL)
+	if transport == nil {
+		return nil
+	}
+	actual, loaded := proxyTransportCache.LoadOrStore(proxyURL, transport)
+	if loaded {
+		transport.CloseIdleConnections()
+		return actual.(*http.Transport)
+	}
+	return transport
 }
 
 // buildProxyTransport creates an HTTP transport configured for the given proxy URL.
