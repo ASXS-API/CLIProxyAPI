@@ -181,8 +181,7 @@ func rewriteSystemRolesInInputArray(rawInput []byte) ([]byte, bool) {
 
 		itemRaw := []byte(item.Raw)
 		if item.Get("role").String() == "system" {
-			updated, err := sjson.SetBytes(itemRaw, "role", "developer")
-			if err == nil {
+			if updated, ok := rewriteJSONObjectStringField(itemRaw, "role", "developer"); ok {
 				itemRaw = updated
 			}
 		}
@@ -224,8 +223,7 @@ func rewriteCodexBuiltinToolArray(rawTools []byte) ([]byte, bool) {
 
 		itemRaw := []byte(item.Raw)
 		if normalizedType := normalizeCodexBuiltinToolType(item.Get("type").String()); normalizedType != "" {
-			updated, err := sjson.SetBytes(itemRaw, "type", normalizedType)
-			if err == nil {
+			if updated, ok := rewriteJSONObjectStringField(itemRaw, "type", normalizedType); ok {
 				itemRaw = updated
 			}
 		}
@@ -243,28 +241,65 @@ func rewriteCodexToolChoice(rawToolChoice []byte) ([]byte, bool) {
 		return rawToolChoice, false
 	}
 
-	result := rawToolChoice
 	changed := false
+	var obj map[string]json.RawMessage
 	if normalizedType := normalizeCodexBuiltinToolType(toolChoiceResult.Get("type").String()); normalizedType != "" {
-		updated, err := sjson.SetBytes(result, "type", normalizedType)
-		if err == nil {
-			result = updated
+		if obj == nil {
+			if !decodeJSONObject(rawToolChoice, &obj) {
+				return rawToolChoice, false
+			}
+		}
+		if rawString, err := marshalJSONNoEscape(normalizedType); err == nil {
+			obj["type"] = rawString
 			changed = true
 		}
 	}
 
-	toolsResult := gjson.GetBytes(result, "tools")
+	toolsResult := toolChoiceResult.Get("tools")
 	if toolsResult.IsArray() {
 		if rewrittenTools, toolsChanged := rewriteCodexBuiltinToolArray([]byte(toolsResult.Raw)); toolsChanged {
-			updated, err := sjson.SetRawBytes(result, "tools", rewrittenTools)
-			if err == nil {
-				result = updated
-				changed = true
+			if obj == nil {
+				if !decodeJSONObject(rawToolChoice, &obj) {
+					return rawToolChoice, false
+				}
 			}
+			obj["tools"] = rewrittenTools
+			changed = true
 		}
 	}
 
-	return result, changed
+	if !changed {
+		return rawToolChoice, false
+	}
+	result, err := marshalJSONNoEscape(obj)
+	if err != nil {
+		return rawToolChoice, false
+	}
+	return result, true
+}
+
+func rewriteJSONObjectStringField(rawJSON []byte, field string, value string) ([]byte, bool) {
+	var obj map[string]json.RawMessage
+	if !decodeJSONObject(rawJSON, &obj) {
+		return rawJSON, false
+	}
+	rawValue, err := marshalJSONNoEscape(value)
+	if err != nil {
+		return rawJSON, false
+	}
+	obj[field] = rawValue
+	result, err := marshalJSONNoEscape(obj)
+	if err != nil {
+		return rawJSON, false
+	}
+	return result, true
+}
+
+func decodeJSONObject(rawJSON []byte, obj *map[string]json.RawMessage) bool {
+	if err := json.Unmarshal(rawJSON, obj); err != nil || obj == nil || *obj == nil {
+		return false
+	}
+	return true
 }
 
 func rawJSONEqualsString(rawJSON []byte, expected string) bool {

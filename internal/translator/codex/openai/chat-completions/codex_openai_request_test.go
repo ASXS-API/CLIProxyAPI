@@ -1,6 +1,8 @@
 package chat_completions
 
 import (
+	"bytes"
+	"fmt"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -808,4 +810,115 @@ func TestToolsDefinitionTranslated(t *testing.T) {
 	if !found {
 		t.Errorf("tool 'search' not found in output tools: %s", gjson.Get(result, "tools").Raw)
 	}
+}
+
+func TestResponseFormatTextAndToolChoiceTranslated(t *testing.T) {
+	input := []byte(`{
+		"model": "gpt-4o",
+		"messages": [{"role": "user", "content": "Return structured data."}],
+		"response_format": {
+			"type": "json_schema",
+			"json_schema": {
+				"name": "lookup_result",
+				"strict": true,
+				"schema": {
+					"type": "object",
+					"properties": {"answer": {"type": "string"}},
+					"required": ["answer"],
+					"additionalProperties": false
+				}
+			}
+		},
+		"text": {"verbosity": "low"},
+		"tools": [
+			{
+				"type": "function",
+				"function": {
+					"name": "lookup",
+					"description": "Lookup data",
+					"parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+					"strict": true
+				}
+			},
+			{"type": "web_search"}
+		],
+		"tool_choice": {"type": "function", "function": {"name": "lookup"}}
+	}`)
+
+	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
+
+	if got := gjson.GetBytes(out, "text.format.type").String(); got != "json_schema" {
+		t.Fatalf("text.format.type = %q, want json_schema: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "text.format.name").String(); got != "lookup_result" {
+		t.Fatalf("text.format.name = %q, want lookup_result", got)
+	}
+	if !gjson.GetBytes(out, "text.format.strict").Bool() {
+		t.Fatalf("text.format.strict should be true")
+	}
+	if got := gjson.GetBytes(out, "text.format.schema.required.0").String(); got != "answer" {
+		t.Fatalf("schema required field = %q, want answer", got)
+	}
+	if got := gjson.GetBytes(out, "text.verbosity").String(); got != "low" {
+		t.Fatalf("text.verbosity = %q, want low", got)
+	}
+	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "lookup" {
+		t.Fatalf("tools.0.name = %q, want lookup", got)
+	}
+	if got := gjson.GetBytes(out, "tools.0.parameters.required.0").String(); got != "query" {
+		t.Fatalf("tools.0.parameters.required.0 = %q, want query", got)
+	}
+	if got := gjson.GetBytes(out, "tools.1.type").String(); got != "web_search" {
+		t.Fatalf("tools.1.type = %q, want web_search", got)
+	}
+	if got := gjson.GetBytes(out, "tool_choice.type").String(); got != "function" {
+		t.Fatalf("tool_choice.type = %q, want function", got)
+	}
+	if got := gjson.GetBytes(out, "tool_choice.name").String(); got != "lookup" {
+		t.Fatalf("tool_choice.name = %q, want lookup", got)
+	}
+	if !gjson.GetBytes(out, "stream").Bool() {
+		t.Fatalf("stream should be true")
+	}
+	if gjson.GetBytes(out, "store").Bool() {
+		t.Fatalf("store should be false")
+	}
+}
+
+var benchmarkChatConvertOutput []byte
+
+func BenchmarkConvertOpenAIRequestToCodexLargePayload(b *testing.B) {
+	rawJSON := largeChatCompletionsPayload(500, 50)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(rawJSON)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		benchmarkChatConvertOutput = ConvertOpenAIRequestToCodex("gpt-4o", rawJSON, true)
+	}
+}
+
+func largeChatCompletionsPayload(messageCount int, toolCount int) []byte {
+	var payload bytes.Buffer
+	payload.WriteString(`{"model":"gpt-4o","messages":[`)
+	for i := 0; i < messageCount; i++ {
+		if i > 0 {
+			payload.WriteByte(',')
+		}
+		role := "user"
+		if i == 0 {
+			role = "system"
+		} else if i%5 == 0 {
+			role = "assistant"
+		}
+		fmt.Fprintf(&payload, `{"role":%q,"content":%q}`, role, fmt.Sprintf("large chat payload message %d", i))
+	}
+	payload.WriteString(`],"tools":[`)
+	for i := 0; i < toolCount; i++ {
+		if i > 0 {
+			payload.WriteByte(',')
+		}
+		fmt.Fprintf(&payload, `{"type":"function","function":{"name":"tool_%d","description":%q,"parameters":{"type":"object","properties":{"query":{"type":"string","description":%q}},"required":["query"]},"strict":true}}`, i, "large tool payload", "large parameter payload")
+	}
+	payload.WriteString(`],"response_format":{"type":"json_schema","json_schema":{"name":"large_result","strict":true,"schema":{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}}},"text":{"verbosity":"low"},"tool_choice":{"type":"function","function":{"name":"tool_0"}}}`)
+	return payload.Bytes()
 }

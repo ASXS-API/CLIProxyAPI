@@ -7,10 +7,12 @@
 package codex
 
 import (
+	"bytes"
+	"encoding/json"
+
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // Applier implements thinking.ProviderApplier for Codex models.
@@ -59,8 +61,7 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 	}
 
 	if config.Mode == thinking.ModeLevel {
-		result, _ := sjson.SetBytes(body, "reasoning.effort", string(config.Level))
-		return result, nil
+		return setCodexReasoningEffort(body, string(config.Level)), nil
 	}
 
 	effort := ""
@@ -80,8 +81,7 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 		return body, nil
 	}
 
-	result, _ := sjson.SetBytes(body, "reasoning.effort", effort)
-	return result, nil
+	return setCodexReasoningEffort(body, effort), nil
 }
 
 func applyCompatibleCodex(body []byte, config thinking.ThinkingConfig) ([]byte, error) {
@@ -115,6 +115,51 @@ func applyCompatibleCodex(body []byte, config thinking.ThinkingConfig) ([]byte, 
 		return body, nil
 	}
 
-	result, _ := sjson.SetBytes(body, "reasoning.effort", effort)
-	return result, nil
+	return setCodexReasoningEffort(body, effort), nil
+}
+
+func setCodexReasoningEffort(body []byte, effort string) []byte {
+	if existing := gjson.GetBytes(body, "reasoning.effort"); existing.Exists() && existing.Type == gjson.String && existing.String() == effort {
+		return body
+	}
+
+	var obj map[string]json.RawMessage
+	if len(bytes.TrimSpace(body)) == 0 {
+		obj = make(map[string]json.RawMessage)
+	} else if err := json.Unmarshal(body, &obj); err != nil || obj == nil {
+		return body
+	}
+
+	reasoning := make(map[string]json.RawMessage)
+	if rawReasoning, ok := obj["reasoning"]; ok && len(bytes.TrimSpace(rawReasoning)) > 0 && !bytes.Equal(bytes.TrimSpace(rawReasoning), []byte("null")) {
+		_ = json.Unmarshal(rawReasoning, &reasoning)
+		if reasoning == nil {
+			reasoning = make(map[string]json.RawMessage)
+		}
+	}
+	rawEffort, err := marshalJSONNoEscape(effort)
+	if err != nil {
+		return body
+	}
+	reasoning["effort"] = rawEffort
+	rawReasoning, err := marshalJSONNoEscape(reasoning)
+	if err != nil {
+		return body
+	}
+	obj["reasoning"] = rawReasoning
+	out, err := marshalJSONNoEscape(obj)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+func marshalJSONNoEscape(value any) ([]byte, error) {
+	var out bytes.Buffer
+	encoder := json.NewEncoder(&out)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(out.Bytes(), []byte("\n")), nil
 }

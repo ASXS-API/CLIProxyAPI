@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -36,6 +37,15 @@ const (
 )
 
 var dataTag = []byte("data:")
+
+type codexStreamPatch int
+
+const (
+	codexStreamKeep codexStreamPatch = iota
+	codexStreamTrue
+	codexStreamFalse
+	codexStreamDelete
+)
 
 // Streamed Codex responses may emit response.output_item.done events while leaving
 // response.completed.response.output empty. Keep the stream path aligned with the
@@ -175,16 +185,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, requestPath)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
-	body, _ = sjson.SetBytes(body, "stream", true)
-	body, _ = sjson.DeleteBytes(body, "previous_response_id")
-	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
-	body, _ = sjson.DeleteBytes(body, "safety_identifier")
-	body, _ = sjson.DeleteBytes(body, "stream_options")
-	body = normalizeCodexInstructions(body)
-	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
-		body = ensureImageGenerationTool(body, baseModel, auth)
-	}
+	body = finalizeCodexRequestBody(body, baseModel, codexStreamTrue, true, e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff, auth)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -330,12 +331,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, requestPath)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
-	body, _ = sjson.DeleteBytes(body, "stream")
-	body = normalizeCodexInstructions(body)
-	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
-		body = ensureImageGenerationTool(body, baseModel, auth)
-	}
+	body = finalizeCodexRequestBody(body, baseModel, codexStreamDelete, false, e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff, auth)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -425,15 +421,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, requestPath)
-	body, _ = sjson.DeleteBytes(body, "previous_response_id")
-	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
-	body, _ = sjson.DeleteBytes(body, "safety_identifier")
-	body, _ = sjson.DeleteBytes(body, "stream_options")
-	body, _ = sjson.SetBytes(body, "model", baseModel)
-	body = normalizeCodexInstructions(body)
-	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
-		body = ensureImageGenerationTool(body, baseModel, auth)
-	}
+	body = finalizeCodexRequestBody(body, baseModel, codexStreamKeep, true, e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff, auth)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -546,13 +534,7 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 		return cliproxyexecutor.Response{}, err
 	}
 
-	body, _ = sjson.SetBytes(body, "model", baseModel)
-	body, _ = sjson.DeleteBytes(body, "previous_response_id")
-	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
-	body, _ = sjson.DeleteBytes(body, "safety_identifier")
-	body, _ = sjson.DeleteBytes(body, "stream_options")
-	body, _ = sjson.SetBytes(body, "stream", false)
-	body = normalizeCodexInstructions(body)
+	body = finalizeCodexRequestBody(body, baseModel, codexStreamFalse, true, false, auth)
 
 	enc, err := tokenizerForCodexModel(baseModel)
 	if err != nil {
@@ -760,7 +742,7 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	}
 
 	if cache.ID != "" {
-		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
+		rawJSON = setTopLevelJSONString(rawJSON, "prompt_cache_key", cache.ID)
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(rawJSON))
 	if err != nil {
@@ -886,11 +868,16 @@ func codexStatusErrorClassification(statusCode int, body []byte) (code string, e
 }
 
 func normalizeCodexInstructions(body []byte) []byte {
-	instructions := gjson.GetBytes(body, "instructions")
-	if !instructions.Exists() || instructions.Type == gjson.Null {
-		body, _ = sjson.SetBytes(body, "instructions", "")
+	var obj map[string]json.RawMessage
+	if !decodeTopLevelJSONObject(body, &obj) {
+		return body
 	}
-	return body
+	normalizeCodexInstructionsObject(obj)
+	out, err := marshalJSONNoEscape(obj)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 var imageGenToolJSON = []byte(`{"type":"image_generation","output_format":"png"}`)
@@ -914,18 +901,143 @@ func ensureImageGenerationTool(body []byte, baseModel string, auth *cliproxyauth
 		return body
 	}
 
-	tools := gjson.GetBytes(body, "tools")
-	if !tools.Exists() || !tools.IsArray() {
-		body, _ = sjson.SetRawBytes(body, "tools", imageGenToolArrayJSON)
+	var obj map[string]json.RawMessage
+	if !decodeTopLevelJSONObject(body, &obj) {
 		return body
+	}
+	ensureImageGenerationToolObject(obj, baseModel, auth)
+	out, err := marshalJSONNoEscape(obj)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+func finalizeCodexRequestBody(body []byte, baseModel string, streamPatch codexStreamPatch, removeUnsupported bool, addImageTool bool, auth *cliproxyauth.Auth) []byte {
+	var obj map[string]json.RawMessage
+	if !decodeTopLevelJSONObject(body, &obj) {
+		return body
+	}
+
+	if baseModel != "" {
+		obj["model"] = marshalRawJSON(baseModel)
+	}
+	switch streamPatch {
+	case codexStreamTrue:
+		obj["stream"] = json.RawMessage(`true`)
+	case codexStreamFalse:
+		obj["stream"] = json.RawMessage(`false`)
+	case codexStreamDelete:
+		delete(obj, "stream")
+	}
+	if removeUnsupported {
+		delete(obj, "previous_response_id")
+		delete(obj, "prompt_cache_retention")
+		delete(obj, "safety_identifier")
+		delete(obj, "stream_options")
+	}
+	normalizeCodexInstructionsObject(obj)
+	if addImageTool {
+		ensureImageGenerationToolObject(obj, baseModel, auth)
+	}
+
+	out, err := marshalJSONNoEscape(obj)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+func normalizeCodexInstructionsObject(obj map[string]json.RawMessage) {
+	instructions, ok := obj["instructions"]
+	if !ok || bytes.Equal(bytes.TrimSpace(instructions), []byte("null")) {
+		obj["instructions"] = json.RawMessage(`""`)
+	}
+}
+
+func ensureImageGenerationToolObject(obj map[string]json.RawMessage, baseModel string, auth *cliproxyauth.Auth) {
+	if strings.HasSuffix(baseModel, "spark") || isCodexFreePlanAuth(auth) {
+		return
+	}
+	toolsRaw, exists := obj["tools"]
+	tools := gjson.ParseBytes(toolsRaw)
+	if !exists || !tools.IsArray() {
+		obj["tools"] = json.RawMessage(imageGenToolArrayJSON)
+		return
 	}
 	for _, t := range tools.Array() {
 		if t.Get("type").String() == "image_generation" {
-			return body
+			return
 		}
 	}
-	body, _ = sjson.SetRawBytes(body, "tools.-1", imageGenToolJSON)
-	return body
+	obj["tools"] = appendRawJSONArray(toolsRaw, imageGenToolJSON)
+}
+
+func setTopLevelJSONString(body []byte, key string, value string) []byte {
+	var obj map[string]json.RawMessage
+	if !decodeTopLevelJSONObject(body, &obj) {
+		return body
+	}
+	obj[key] = marshalRawJSON(value)
+	out, err := marshalJSONNoEscape(obj)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+func decodeTopLevelJSONObject(body []byte, obj *map[string]json.RawMessage) bool {
+	if len(bytes.TrimSpace(body)) == 0 {
+		*obj = make(map[string]json.RawMessage)
+		return true
+	}
+	if err := json.Unmarshal(body, obj); err != nil || obj == nil || *obj == nil {
+		return false
+	}
+	return true
+}
+
+func marshalRawJSON(value any) json.RawMessage {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil
+	}
+	return raw
+}
+
+func marshalJSONNoEscape(value any) ([]byte, error) {
+	var out bytes.Buffer
+	encoder := json.NewEncoder(&out)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(out.Bytes(), []byte("\n")), nil
+}
+
+func appendRawJSONArray(rawArray []byte, rawItem []byte) json.RawMessage {
+	trimmed := bytes.TrimSpace(rawArray)
+	if len(trimmed) < 2 || trimmed[0] != '[' || trimmed[len(trimmed)-1] != ']' {
+		out := make([]byte, 0, len(rawItem)+2)
+		out = append(out, '[')
+		out = append(out, rawItem...)
+		out = append(out, ']')
+		return out
+	}
+	inner := bytes.TrimSpace(trimmed[1 : len(trimmed)-1])
+	if len(inner) == 0 {
+		out := make([]byte, 0, len(rawItem)+2)
+		out = append(out, '[')
+		out = append(out, rawItem...)
+		out = append(out, ']')
+		return out
+	}
+	out := make([]byte, 0, len(trimmed)+1+len(rawItem))
+	out = append(out, trimmed[:len(trimmed)-1]...)
+	out = append(out, ',')
+	out = append(out, rawItem...)
+	out = append(out, ']')
+	return out
 }
 
 func publishCodexImageToolUsage(ctx context.Context, reporter *helps.UsageReporter, body []byte, completedData []byte) {
