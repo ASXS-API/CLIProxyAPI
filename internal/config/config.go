@@ -86,8 +86,9 @@ type Config struct {
 	// MaxRetryCredentials defines the maximum number of credentials to try for a failed request.
 	// Set to 0 or a negative value to keep trying all available credentials (legacy behavior).
 	MaxRetryCredentials int `yaml:"max-retry-credentials" json:"max-retry-credentials"`
-	// MaxRetryInterval defines the maximum wait time in seconds before retrying a cooled-down credential.
-	MaxRetryInterval int `yaml:"max-retry-interval" json:"max-retry-interval"`
+	// MaxRetryInterval defines the maximum wait before retrying a cooled-down credential.
+	// Numeric values are seconds; duration strings like "300ms" are also accepted.
+	MaxRetryInterval RetryIntervalSeconds `yaml:"max-retry-interval" json:"max-retry-interval"`
 
 	// QuotaExceeded defines the behavior when a quota is exceeded.
 	QuotaExceeded QuotaExceeded `yaml:"quota-exceeded" json:"quota-exceeded"`
@@ -696,6 +697,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	if cfg.MaxRetryCredentials < 0 {
 		cfg.MaxRetryCredentials = 0
+	}
+	if cfg.MaxRetryInterval < 0 {
+		cfg.MaxRetryInterval = 0
 	}
 
 	// Sanitize Gemini API key configuration and migrate legacy entries.

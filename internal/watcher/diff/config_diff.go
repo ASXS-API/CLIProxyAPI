@@ -64,7 +64,7 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 		changes = append(changes, fmt.Sprintf("max-retry-credentials: %d -> %d", oldCfg.MaxRetryCredentials, newCfg.MaxRetryCredentials))
 	}
 	if oldCfg.MaxRetryInterval != newCfg.MaxRetryInterval {
-		changes = append(changes, fmt.Sprintf("max-retry-interval: %d -> %d", oldCfg.MaxRetryInterval, newCfg.MaxRetryInterval))
+		changes = append(changes, fmt.Sprintf("max-retry-interval: %s -> %s", oldCfg.MaxRetryInterval, newCfg.MaxRetryInterval))
 	}
 	if oldCfg.ProxyURL != newCfg.ProxyURL {
 		changes = append(changes, fmt.Sprintf("proxy-url: %s -> %s", formatProxyURL(oldCfg.ProxyURL), formatProxyURL(newCfg.ProxyURL)))

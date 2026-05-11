@@ -1,9 +1,12 @@
 package tui
 
 import (
+	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -196,7 +199,7 @@ func (m configTabModel) submitEdit(idx int, newValue string) tea.Cmd {
 			}
 			value = valueInt
 			err = m.client.PutIntField(f.apiPath, valueInt)
-		case "string":
+		case "string", "duration":
 			value = newValue
 			err = m.client.PutStringField(f.apiPath, newValue)
 		}
@@ -213,6 +216,34 @@ func configFieldEditValue(f configField) string {
 		return rawString
 	}
 	return f.value
+}
+
+func retryIntervalDisplayValue(cfg map[string]any) string {
+	value, ok := cfg["max-retry-interval"]
+	if !ok {
+		return "0"
+	}
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case float64:
+		return formatRetryIntervalSeconds(v)
+	case json.Number:
+		seconds, _ := v.Float64()
+		return formatRetryIntervalSeconds(seconds)
+	default:
+		return "0"
+	}
+}
+
+func formatRetryIntervalSeconds(seconds float64) string {
+	if seconds <= 0 {
+		return "0"
+	}
+	if math.Trunc(seconds) == seconds {
+		return strconv.FormatInt(int64(seconds), 10)
+	}
+	return time.Duration(seconds * float64(time.Second)).String()
 }
 
 func (m *configTabModel) SetSize(w, h int) {
@@ -332,7 +363,7 @@ func (m configTabModel) parseConfig(cfg map[string]any) []configField {
 	fields = append(fields, configField{"Debug", "debug", "bool", fmt.Sprintf("%v", getBool(cfg, "debug")), nil})
 	fields = append(fields, configField{"Proxy URL", "proxy-url", "string", getString(cfg, "proxy-url"), nil})
 	fields = append(fields, configField{"Request Retry", "request-retry", "int", fmt.Sprintf("%.0f", getFloat(cfg, "request-retry")), nil})
-	fields = append(fields, configField{"Max Retry Interval (s)", "max-retry-interval", "int", fmt.Sprintf("%.0f", getFloat(cfg, "max-retry-interval")), nil})
+	fields = append(fields, configField{"Max Retry Interval", "max-retry-interval", "duration", retryIntervalDisplayValue(cfg), nil})
 	fields = append(fields, configField{"Force Model Prefix", "force-model-prefix", "string", getString(cfg, "force-model-prefix"), nil})
 
 	// Logging

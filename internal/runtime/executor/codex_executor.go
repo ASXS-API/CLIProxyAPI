@@ -6,10 +6,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
@@ -38,6 +40,8 @@ const (
 
 var dataTag = []byte("data:")
 
+const codexRequestTranslationCacheMetadataKey = "codex_request_translation_cache"
+
 type codexStreamPatch int
 
 const (
@@ -46,6 +50,20 @@ const (
 	codexStreamFalse
 	codexStreamDelete
 )
+
+type codexRequestTranslationCache struct {
+	mu      sync.Mutex
+	entries map[codexRequestTranslationCacheKey][]byte
+}
+
+type codexRequestTranslationCacheKey struct {
+	from   sdktranslator.Format
+	to     sdktranslator.Format
+	model  string
+	stream bool
+	length int
+	digest uint64
+}
 
 // Streamed Codex responses may emit response.output_item.done events while leaving
 // response.completed.response.output empty. Keep the stream path aligned with the
@@ -108,6 +126,70 @@ func patchCodexCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]
 
 	completedDataPatched, _ := sjson.SetRawBytes(eventData, "response.output", outputArray)
 	return completedDataPatched
+}
+
+func translatedCodexRequest(opts cliproxyexecutor.Options, from, to sdktranslator.Format, model string, rawJSON []byte, stream bool) []byte {
+	if from != sdktranslator.FromString("openai-response") || to != sdktranslator.FromString("codex") || opts.Metadata == nil {
+		return sdktranslator.TranslateRequest(from, to, model, rawJSON, stream)
+	}
+
+	cache, _ := opts.Metadata[codexRequestTranslationCacheMetadataKey].(*codexRequestTranslationCache)
+	if cache == nil {
+		cache = &codexRequestTranslationCache{entries: make(map[codexRequestTranslationCacheKey][]byte)}
+		opts.Metadata[codexRequestTranslationCacheMetadataKey] = cache
+	}
+
+	key := codexRequestTranslationCacheKey{
+		from:   from,
+		to:     to,
+		model:  model,
+		stream: stream,
+		length: len(rawJSON),
+		digest: hashBytes(rawJSON),
+	}
+
+	cache.mu.Lock()
+	if cached, ok := cache.entries[key]; ok {
+		cache.mu.Unlock()
+		return cached
+	}
+	cache.mu.Unlock()
+
+	translated := sdktranslator.TranslateRequest(from, to, model, rawJSON, stream)
+
+	cache.mu.Lock()
+	if cached, ok := cache.entries[key]; ok {
+		cache.mu.Unlock()
+		return cached
+	}
+	cache.entries[key] = translated
+	cache.mu.Unlock()
+	return translated
+}
+
+func translateCodexRequestPair(opts cliproxyexecutor.Options, from, to sdktranslator.Format, model string, originalPayload, payload []byte, stream bool) (originalTranslated []byte, translated []byte) {
+	translated = translatedCodexRequest(opts, from, to, model, payload, stream)
+	if sameBytesBacking(originalPayload, payload) {
+		return translated, translated
+	}
+	originalTranslated = translatedCodexRequest(opts, from, to, model, originalPayload, stream)
+	return originalTranslated, translated
+}
+
+func hashBytes(raw []byte) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write(raw)
+	return h.Sum64()
+}
+
+func sameBytesBacking(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	if len(a) == 0 {
+		return true
+	}
+	return &a[0] == &b[0]
 }
 
 // CodexExecutor is a stateless executor for Codex (OpenAI Responses API entrypoint).
@@ -174,8 +256,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+	originalTranslated, body := translateCodexRequestPair(opts, from, to, baseModel, originalPayload, req.Payload, false)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -185,10 +266,11 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, requestPath)
-	body = finalizeCodexRequestBody(body, baseModel, codexStreamTrue, true, e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff, auth)
+	cacheID := e.codexCacheID(ctx, from, req)
+	body = finalizeCodexRequestBody(body, baseModel, codexStreamTrue, true, e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff, auth, cacheID)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
-	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
+	httpReq, err := e.cacheHelper(ctx, url, body, cacheID)
 	if err != nil {
 		return resp, err
 	}
@@ -320,8 +402,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+	originalTranslated, body := translateCodexRequestPair(opts, from, to, baseModel, originalPayload, req.Payload, false)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -331,10 +412,11 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, requestPath)
-	body = finalizeCodexRequestBody(body, baseModel, codexStreamDelete, false, e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff, auth)
+	cacheID := e.codexCacheID(ctx, from, req)
+	body = finalizeCodexRequestBody(body, baseModel, codexStreamDelete, false, e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff, auth, cacheID)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
-	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
+	httpReq, err := e.cacheHelper(ctx, url, body, cacheID)
 	if err != nil {
 		return resp, err
 	}
@@ -410,8 +492,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
+	originalTranslated, body := translateCodexRequestPair(opts, from, to, baseModel, originalPayload, req.Payload, true)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -421,10 +502,11 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, requestPath)
-	body = finalizeCodexRequestBody(body, baseModel, codexStreamKeep, true, e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff, auth)
+	cacheID := e.codexCacheID(ctx, from, req)
+	body = finalizeCodexRequestBody(body, baseModel, codexStreamKeep, true, e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff, auth, cacheID)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
-	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
+	httpReq, err := e.cacheHelper(ctx, url, body, cacheID)
 	if err != nil {
 		return nil, err
 	}
@@ -534,7 +616,7 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 		return cliproxyexecutor.Response{}, err
 	}
 
-	body = finalizeCodexRequestBody(body, baseModel, codexStreamFalse, true, false, auth)
+	body = finalizeCodexRequestBody(body, baseModel, codexStreamFalse, true, false, auth, "")
 
 	enc, err := tokenizerForCodexModel(baseModel)
 	if err != nil {
@@ -715,7 +797,7 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	return auth, nil
 }
 
-func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, req cliproxyexecutor.Request, rawJSON []byte) (*http.Request, error) {
+func (e *CodexExecutor) codexCacheID(ctx context.Context, from sdktranslator.Format, req cliproxyexecutor.Request) string {
 	var cache helps.CodexCache
 	if from == "claude" {
 		userIDResult := gjson.GetBytes(req.Payload, "metadata.user_id")
@@ -740,16 +822,16 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 			cache.ID = uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache:"+apiKey)).String()
 		}
 	}
+	return cache.ID
+}
 
-	if cache.ID != "" {
-		rawJSON = setTopLevelJSONString(rawJSON, "prompt_cache_key", cache.ID)
-	}
+func (e *CodexExecutor) cacheHelper(ctx context.Context, url string, rawJSON []byte, cacheID string) (*http.Request, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(rawJSON))
 	if err != nil {
 		return nil, err
 	}
-	if cache.ID != "" {
-		httpReq.Header.Set("Session_id", cache.ID)
+	if cacheID != "" {
+		httpReq.Header.Set("Session_id", cacheID)
 	}
 	return httpReq, nil
 }
@@ -913,7 +995,7 @@ func ensureImageGenerationTool(body []byte, baseModel string, auth *cliproxyauth
 	return out
 }
 
-func finalizeCodexRequestBody(body []byte, baseModel string, streamPatch codexStreamPatch, removeUnsupported bool, addImageTool bool, auth *cliproxyauth.Auth) []byte {
+func finalizeCodexRequestBody(body []byte, baseModel string, streamPatch codexStreamPatch, removeUnsupported bool, addImageTool bool, auth *cliproxyauth.Auth, promptCacheKey string) []byte {
 	var obj map[string]json.RawMessage
 	if !decodeTopLevelJSONObject(body, &obj) {
 		return body
@@ -939,6 +1021,9 @@ func finalizeCodexRequestBody(body []byte, baseModel string, streamPatch codexSt
 	normalizeCodexInstructionsObject(obj)
 	if addImageTool {
 		ensureImageGenerationToolObject(obj, baseModel, auth)
+	}
+	if promptCacheKey != "" {
+		obj["prompt_cache_key"] = marshalRawJSON(promptCacheKey)
 	}
 
 	out, err := marshalJSONNoEscape(obj)
@@ -971,19 +1056,6 @@ func ensureImageGenerationToolObject(obj map[string]json.RawMessage, baseModel s
 		}
 	}
 	obj["tools"] = appendRawJSONArray(toolsRaw, imageGenToolJSON)
-}
-
-func setTopLevelJSONString(body []byte, key string, value string) []byte {
-	var obj map[string]json.RawMessage
-	if !decodeTopLevelJSONObject(body, &obj) {
-		return body
-	}
-	obj[key] = marshalRawJSON(value)
-	out, err := marshalJSONNoEscape(obj)
-	if err != nil {
-		return body
-	}
-	return out
 }
 
 func decodeTopLevelJSONObject(body []byte, obj *map[string]json.RawMessage) bool {

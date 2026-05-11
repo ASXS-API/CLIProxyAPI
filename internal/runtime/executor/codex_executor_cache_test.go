@@ -27,7 +27,9 @@ func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFrom
 	}
 	url := "https://example.com/responses"
 
-	httpReq, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, req, rawJSON)
+	cacheID := executor.codexCacheID(ctx, sdktranslator.FromString("openai"), req)
+	bodyWithCache := finalizeCodexRequestBody(rawJSON, "gpt-5.3-codex", codexStreamKeep, false, false, nil, cacheID)
+	httpReq, err := executor.cacheHelper(ctx, url, bodyWithCache, cacheID)
 	if err != nil {
 		t.Fatalf("cacheHelper error: %v", err)
 	}
@@ -49,7 +51,9 @@ func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFrom
 		t.Fatalf("Session_id = %q, want %q", gotSession, expectedKey)
 	}
 
-	httpReq2, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, req, rawJSON)
+	cacheID2 := executor.codexCacheID(ctx, sdktranslator.FromString("openai"), req)
+	bodyWithCache2 := finalizeCodexRequestBody(rawJSON, "gpt-5.3-codex", codexStreamKeep, false, false, nil, cacheID2)
+	httpReq2, err := executor.cacheHelper(ctx, url, bodyWithCache2, cacheID2)
 	if err != nil {
 		t.Fatalf("cacheHelper error (second call): %v", err)
 	}

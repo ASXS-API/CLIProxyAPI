@@ -268,7 +268,15 @@ func (h *Handler) GetMaxRetryInterval(c *gin.Context) {
 	c.JSON(200, gin.H{"max-retry-interval": h.cfg.MaxRetryInterval})
 }
 func (h *Handler) PutMaxRetryInterval(c *gin.Context) {
-	h.updateIntField(c, func(v int) { h.cfg.MaxRetryInterval = v })
+	var body struct {
+		Value *config.RetryIntervalSeconds `json:"value"`
+	}
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	h.cfg.MaxRetryInterval = *body.Value
+	h.persist(c)
 }
 
 // ForceModelPrefix
