@@ -442,6 +442,33 @@ func TestConvertOpenAIResponsesRequestToCodex_FastPathMatchesLegacySemantics(t *
 	}
 }
 
+func TestRewriteOpenAIResponsesRequestObjectForCodexMatchesConverter(t *testing.T) {
+	inputJSON := []byte(`{
+		"model":"gpt-5.4-mini",
+		"input":[
+			{"type":"message","role":"system","content":[{"type":"input_text","text":"system"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hello <world>"}]}
+		],
+		"tools":[{"type":"web_search_preview"}],
+		"tool_choice":{"type":"web_search_preview_2025_03_11"},
+		"service_tier":"auto",
+		"max_output_tokens":1024,
+		"context_management":[{"type":"compaction"}],
+		"user":"abc"
+	}`)
+
+	obj, ok := RewriteOpenAIResponsesRequestObjectForCodex(inputJSON)
+	if !ok {
+		t.Fatal("RewriteOpenAIResponsesRequestObjectForCodex returned false")
+	}
+	got, err := MarshalCodexRequestObject(obj)
+	if err != nil {
+		t.Fatalf("MarshalCodexRequestObject error: %v", err)
+	}
+	want := ConvertOpenAIResponsesRequestToCodex("gpt-5.4-mini", inputJSON, false)
+	assertJSONSemanticallyEqual(t, want, got)
+}
+
 func TestConvertOpenAIResponsesRequestToCodex_NormalizesEscapedWebSearchAlias(t *testing.T) {
 	inputJSON := []byte(`{
 		"model":"gpt-5.4-mini",

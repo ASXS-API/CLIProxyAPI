@@ -10,6 +10,9 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+// CodexRequestObject is the top-level Responses request object after Codex compatibility rewrites.
+type CodexRequestObject = map[string]json.RawMessage
+
 func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte, _ bool) []byte {
 	if rawJSON, ok := rewriteOpenAIResponsesRequestForCodex(inputRawJSON); ok {
 		return rawJSON
@@ -56,9 +59,32 @@ func convertOpenAIResponsesRequestToCodexLegacy(modelName string, inputRawJSON [
 }
 
 func rewriteOpenAIResponsesRequestForCodex(inputRawJSON []byte) ([]byte, bool) {
+	obj, ok := RewriteOpenAIResponsesRequestObjectForCodex(inputRawJSON)
+	if !ok {
+		return nil, false
+	}
+
+	rawJSON, err := MarshalCodexRequestObject(obj)
+	if err != nil {
+		return nil, false
+	}
+	return rawJSON, true
+}
+
+// RewriteOpenAIResponsesRequestObjectForCodex parses and rewrites an OpenAI Responses request for Codex without marshaling it.
+func RewriteOpenAIResponsesRequestObjectForCodex(inputRawJSON []byte) (CodexRequestObject, bool) {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(inputRawJSON, &obj); err != nil || obj == nil {
 		return nil, false
+	}
+	RewriteOpenAIResponsesRequestObjectFieldsForCodex(obj)
+	return obj, true
+}
+
+// RewriteOpenAIResponsesRequestObjectFieldsForCodex applies Codex compatibility rewrites to a parsed request object.
+func RewriteOpenAIResponsesRequestObjectFieldsForCodex(obj CodexRequestObject) {
+	if obj == nil {
+		return
 	}
 
 	if rawInput, exists := obj["input"]; exists {
@@ -93,12 +119,11 @@ func rewriteOpenAIResponsesRequestForCodex(inputRawJSON []byte) ([]byte, bool) {
 			obj["tool_choice"] = rewrittenToolChoice
 		}
 	}
+}
 
-	rawJSON, err := marshalJSONNoEscape(obj)
-	if err != nil {
-		return nil, false
-	}
-	return rawJSON, true
+// MarshalCodexRequestObject marshals a rewritten Codex request object without HTML escaping.
+func MarshalCodexRequestObject(obj CodexRequestObject) ([]byte, error) {
+	return marshalJSONNoEscape(obj)
 }
 
 func rewriteResponsesInput(rawInput json.RawMessage) json.RawMessage {
