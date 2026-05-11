@@ -1,6 +1,8 @@
 package responses
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 
 	log "github.com/sirupsen/logrus"
@@ -9,6 +11,14 @@ import (
 )
 
 func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte, _ bool) []byte {
+	if rawJSON, ok := rewriteOpenAIResponsesRequestForCodex(inputRawJSON); ok {
+		return rawJSON
+	}
+
+	return convertOpenAIResponsesRequestToCodexLegacy(modelName, inputRawJSON)
+}
+
+func convertOpenAIResponsesRequestToCodexLegacy(modelName string, inputRawJSON []byte) []byte {
 	rawJSON := inputRawJSON
 
 	inputResult := gjson.GetBytes(rawJSON, "input")
@@ -45,6 +55,241 @@ func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte,
 	return rawJSON
 }
 
+func rewriteOpenAIResponsesRequestForCodex(inputRawJSON []byte) ([]byte, bool) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(inputRawJSON, &obj); err != nil || obj == nil {
+		return nil, false
+	}
+
+	if rawInput, exists := obj["input"]; exists {
+		obj["input"] = rewriteResponsesInput(rawInput)
+	}
+
+	obj["stream"] = json.RawMessage(`true`)
+	obj["store"] = json.RawMessage(`false`)
+	obj["parallel_tool_calls"] = json.RawMessage(`true`)
+	obj["include"] = json.RawMessage(`["reasoning.encrypted_content"]`)
+
+	delete(obj, "max_output_tokens")
+	delete(obj, "max_completion_tokens")
+	delete(obj, "temperature")
+	delete(obj, "top_p")
+	delete(obj, "truncation")
+	delete(obj, "context_management")
+	delete(obj, "user")
+
+	if rawServiceTier, exists := obj["service_tier"]; exists && !rawJSONEqualsString(rawServiceTier, "priority") {
+		delete(obj, "service_tier")
+	}
+
+	if rawTools, exists := obj["tools"]; exists {
+		if rewrittenTools, changed := rewriteCodexBuiltinToolArray(rawTools); changed {
+			obj["tools"] = rewrittenTools
+		}
+	}
+
+	if rawToolChoice, exists := obj["tool_choice"]; exists {
+		if rewrittenToolChoice, changed := rewriteCodexToolChoice(rawToolChoice); changed {
+			obj["tool_choice"] = rewrittenToolChoice
+		}
+	}
+
+	rawJSON, err := marshalJSONNoEscape(obj)
+	if err != nil {
+		return nil, false
+	}
+	return rawJSON, true
+}
+
+func rewriteResponsesInput(rawInput json.RawMessage) json.RawMessage {
+	switch firstNonSpaceJSONByte(rawInput) {
+	case '"':
+		inputText, ok := decodeJSONString(rawInput)
+		if !ok {
+			return rawInput
+		}
+		rawJSON, err := marshalJSONNoEscape([]struct {
+			Type    string `json:"type"`
+			Role    string `json:"role"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		}{
+			{
+				Type: "message",
+				Role: "user",
+				Content: []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				}{
+					{Type: "input_text", Text: inputText},
+				},
+			},
+		})
+		if err == nil {
+			return rawJSON
+		}
+		return rawInput
+	case '[':
+		if rewrittenInput, changed := rewriteSystemRolesInInputArray(rawInput); changed {
+			return rewrittenInput
+		}
+	}
+	return rawInput
+}
+
+func firstNonSpaceJSONByte(rawJSON []byte) byte {
+	for _, b := range rawJSON {
+		switch b {
+		case ' ', '\n', '\r', '\t':
+			continue
+		default:
+			return b
+		}
+	}
+	return 0
+}
+
+func rewriteSystemRolesInInputArray(rawInput []byte) ([]byte, bool) {
+	inputResult := gjson.ParseBytes(rawInput)
+	if !inputResult.IsArray() {
+		return rawInput, false
+	}
+
+	hasSystemRole := false
+	inputResult.ForEach(func(_, item gjson.Result) bool {
+		if item.Get("role").String() == "system" {
+			hasSystemRole = true
+			return false
+		}
+		return true
+	})
+	if !hasSystemRole {
+		return rawInput, false
+	}
+
+	var out bytes.Buffer
+	out.Grow(len(rawInput))
+	out.WriteByte('[')
+	first := true
+	inputResult.ForEach(func(_, item gjson.Result) bool {
+		if !first {
+			out.WriteByte(',')
+		}
+		first = false
+
+		itemRaw := []byte(item.Raw)
+		if item.Get("role").String() == "system" {
+			updated, err := sjson.SetBytes(itemRaw, "role", "developer")
+			if err == nil {
+				itemRaw = updated
+			}
+		}
+		out.Write(itemRaw)
+		return true
+	})
+	out.WriteByte(']')
+
+	return out.Bytes(), true
+}
+
+func rewriteCodexBuiltinToolArray(rawTools []byte) ([]byte, bool) {
+	toolsResult := gjson.ParseBytes(rawTools)
+	if !toolsResult.IsArray() {
+		return rawTools, false
+	}
+
+	hasAlias := false
+	toolsResult.ForEach(func(_, item gjson.Result) bool {
+		if normalizeCodexBuiltinToolType(item.Get("type").String()) != "" {
+			hasAlias = true
+			return false
+		}
+		return true
+	})
+	if !hasAlias {
+		return rawTools, false
+	}
+
+	var out bytes.Buffer
+	out.Grow(len(rawTools))
+	out.WriteByte('[')
+	first := true
+	toolsResult.ForEach(func(_, item gjson.Result) bool {
+		if !first {
+			out.WriteByte(',')
+		}
+		first = false
+
+		itemRaw := []byte(item.Raw)
+		if normalizedType := normalizeCodexBuiltinToolType(item.Get("type").String()); normalizedType != "" {
+			updated, err := sjson.SetBytes(itemRaw, "type", normalizedType)
+			if err == nil {
+				itemRaw = updated
+			}
+		}
+		out.Write(itemRaw)
+		return true
+	})
+	out.WriteByte(']')
+
+	return out.Bytes(), true
+}
+
+func rewriteCodexToolChoice(rawToolChoice []byte) ([]byte, bool) {
+	toolChoiceResult := gjson.ParseBytes(rawToolChoice)
+	if !toolChoiceResult.IsObject() {
+		return rawToolChoice, false
+	}
+
+	result := rawToolChoice
+	changed := false
+	if normalizedType := normalizeCodexBuiltinToolType(toolChoiceResult.Get("type").String()); normalizedType != "" {
+		updated, err := sjson.SetBytes(result, "type", normalizedType)
+		if err == nil {
+			result = updated
+			changed = true
+		}
+	}
+
+	toolsResult := gjson.GetBytes(result, "tools")
+	if toolsResult.IsArray() {
+		if rewrittenTools, toolsChanged := rewriteCodexBuiltinToolArray([]byte(toolsResult.Raw)); toolsChanged {
+			updated, err := sjson.SetRawBytes(result, "tools", rewrittenTools)
+			if err == nil {
+				result = updated
+				changed = true
+			}
+		}
+	}
+
+	return result, changed
+}
+
+func rawJSONEqualsString(rawJSON []byte, expected string) bool {
+	value, ok := decodeJSONString(rawJSON)
+	return ok && value == expected
+}
+
+func decodeJSONString(rawJSON []byte) (string, bool) {
+	var value string
+	if err := json.Unmarshal(rawJSON, &value); err != nil {
+		return "", false
+	}
+	return value, true
+}
+
+func marshalJSONNoEscape(value any) ([]byte, error) {
+	var out bytes.Buffer
+	encoder := json.NewEncoder(&out)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(out.Bytes(), []byte("\n")), nil
+}
+
 // applyResponsesCompactionCompatibility handles OpenAI Responses context_management.compaction
 // for Codex upstream compatibility.
 //
@@ -74,10 +319,12 @@ func convertSystemRoleToDeveloper(rawJSON []byte) []byte {
 	inputArray := inputResult.Array()
 	result := rawJSON
 
-	// Directly modify role values for items with "system" role
+	// Use the already parsed input item instead of re-querying the full payload
+	// for every index. Large Responses payloads make full-document path lookups
+	// very expensive under concurrency.
 	for i := 0; i < len(inputArray); i++ {
-		rolePath := fmt.Sprintf("input.%d.role", i)
-		if gjson.GetBytes(result, rolePath).String() == "system" {
+		if inputArray[i].Get("role").String() == "system" {
+			rolePath := fmt.Sprintf("input.%d.role", i)
 			result, _ = sjson.SetBytes(result, rolePath, "developer")
 		}
 	}
@@ -88,6 +335,10 @@ func convertSystemRoleToDeveloper(rawJSON []byte) []byte {
 // normalizeCodexBuiltinTools rewrites legacy/preview built-in tool variants to the
 // stable names expected by the current Codex upstream.
 func normalizeCodexBuiltinTools(rawJSON []byte) []byte {
+	if !bytes.Contains(rawJSON, []byte("web_search_preview")) {
+		return rawJSON
+	}
+
 	result := rawJSON
 
 	tools := gjson.GetBytes(result, "tools")
@@ -95,26 +346,26 @@ func normalizeCodexBuiltinTools(rawJSON []byte) []byte {
 		toolArray := tools.Array()
 		for i := 0; i < len(toolArray); i++ {
 			typePath := fmt.Sprintf("tools.%d.type", i)
-			result = normalizeCodexBuiltinToolAtPath(result, typePath)
+			result = normalizeCodexBuiltinToolAtPath(result, typePath, toolArray[i].Get("type").String())
 		}
 	}
 
-	result = normalizeCodexBuiltinToolAtPath(result, "tool_choice.type")
+	toolChoice := gjson.GetBytes(result, "tool_choice")
+	result = normalizeCodexBuiltinToolAtPath(result, "tool_choice.type", toolChoice.Get("type").String())
 
-	toolChoiceTools := gjson.GetBytes(result, "tool_choice.tools")
+	toolChoiceTools := toolChoice.Get("tools")
 	if toolChoiceTools.IsArray() {
 		toolArray := toolChoiceTools.Array()
 		for i := 0; i < len(toolArray); i++ {
 			typePath := fmt.Sprintf("tool_choice.tools.%d.type", i)
-			result = normalizeCodexBuiltinToolAtPath(result, typePath)
+			result = normalizeCodexBuiltinToolAtPath(result, typePath, toolArray[i].Get("type").String())
 		}
 	}
 
 	return result
 }
 
-func normalizeCodexBuiltinToolAtPath(rawJSON []byte, path string) []byte {
-	currentType := gjson.GetBytes(rawJSON, path).String()
+func normalizeCodexBuiltinToolAtPath(rawJSON []byte, path string, currentType string) []byte {
 	normalizedType := normalizeCodexBuiltinToolType(currentType)
 	if normalizedType == "" {
 		return rawJSON
