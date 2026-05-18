@@ -17,6 +17,8 @@ import (
 const (
 	proxyPoolMaxTransports         = 128
 	proxyPoolMaxActivePerTransport = 8
+	proxyPoolIdleTTL               = 10 * time.Minute
+	proxyPoolIdleSweepInterval     = time.Minute
 
 	proxyReuseReasonAuthProxy   = "auth_proxy"
 	proxyReuseReasonNoProxy     = "no_proxy"
@@ -34,11 +36,16 @@ var (
 )
 
 type proxyTransportPoolRegistry struct {
-	mu    sync.Mutex
-	pools map[string]*proxyTransportPool
+	mu          sync.Mutex
+	janitorOnce sync.Once
+	pools       map[string]*proxyTransportPool
 }
 
 func (r *proxyTransportPoolRegistry) pool(proxyURL string) *proxyTransportPool {
+	r.janitorOnce.Do(func() {
+		go r.runIdleJanitor()
+	})
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -48,6 +55,30 @@ func (r *proxyTransportPoolRegistry) pool(proxyURL string) *proxyTransportPool {
 		r.pools[proxyURL] = pool
 	}
 	return pool
+}
+
+func (r *proxyTransportPoolRegistry) runIdleJanitor() {
+	ticker := time.NewTicker(proxyPoolIdleSweepInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		r.evictIdleTransports(time.Now(), proxyPoolIdleTTL)
+	}
+}
+
+func (r *proxyTransportPoolRegistry) evictIdleTransports(now time.Time, idleFor time.Duration) int {
+	r.mu.Lock()
+	pools := make([]*proxyTransportPool, 0, len(r.pools))
+	for _, pool := range r.pools {
+		pools = append(pools, pool)
+	}
+	r.mu.Unlock()
+
+	evicted := 0
+	for _, pool := range pools {
+		evicted += pool.evictIdle(now, idleFor)
+	}
+	return evicted
 }
 
 type proxyTransportPool struct {
@@ -61,6 +92,7 @@ type pooledProxyTransport struct {
 	index     int
 	transport http.RoundTripper
 	active    int
+	lastUsed  time.Time
 }
 
 type proxyTransportLease struct {
@@ -95,6 +127,7 @@ func (p *proxyTransportPool) acquire() (*proxyTransportLease, error) {
 		id:        globalProxyTransportID.Add(1),
 		index:     len(p.transports) + 1,
 		transport: transport,
+		lastUsed:  time.Now(),
 	}
 	p.transports = append(p.transports, pooled)
 	return p.acquireLocked(pooled), nil
@@ -102,6 +135,7 @@ func (p *proxyTransportPool) acquire() (*proxyTransportLease, error) {
 
 func (p *proxyTransportPool) acquireLocked(transport *pooledProxyTransport) *proxyTransportLease {
 	transport.active++
+	transport.lastUsed = time.Now()
 	return &proxyTransportLease{
 		transport:      transport,
 		streamID:       globalProxyStreamID.Add(1),
@@ -119,6 +153,7 @@ func (l *proxyTransportLease) release(ctx context.Context, status string, err er
 	l.pool.mu.Lock()
 	l.transport.active--
 	active := l.transport.active
+	l.transport.lastUsed = time.Now()
 	l.pool.mu.Unlock()
 
 	entry := LogWithRequestID(ctx)
@@ -134,6 +169,33 @@ func (l *proxyTransportLease) release(ctx context.Context, status string, err er
 		proxyPoolMaxActivePerTransport,
 		status,
 	)
+}
+
+func (p *proxyTransportPool) evictIdle(now time.Time, idleFor time.Duration) int {
+	p.mu.Lock()
+	kept := p.transports[:0]
+	evicted := make([]http.RoundTripper, 0)
+	for _, transport := range p.transports {
+		if transport.active == 0 && now.Sub(transport.lastUsed) >= idleFor {
+			evicted = append(evicted, transport.transport)
+			continue
+		}
+		transport.index = len(kept) + 1
+		kept = append(kept, transport)
+	}
+	p.transports = kept
+	p.mu.Unlock()
+
+	for _, transport := range evicted {
+		closeIdleConnections(transport)
+	}
+	return len(evicted)
+}
+
+func closeIdleConnections(transport http.RoundTripper) {
+	if closer, ok := transport.(interface{ CloseIdleConnections() }); ok {
+		closer.CloseIdleConnections()
+	}
 }
 
 type proxyPoolRoundTripper struct {

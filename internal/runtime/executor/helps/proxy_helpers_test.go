@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -339,13 +340,20 @@ func closeResponseBody(t *testing.T, resp *http.Response) {
 }
 
 func resetProxyTransportPoolsForTest() {
-	globalProxyTransportPools = &proxyTransportPoolRegistry{pools: make(map[string]*proxyTransportPool)}
+	globalProxyTransportPools.mu.Lock()
+	globalProxyTransportPools.pools = make(map[string]*proxyTransportPool)
+	globalProxyTransportPools.mu.Unlock()
 	globalProxyTransportID.Store(0)
 	globalProxyStreamID.Store(0)
 }
 
 func proxyTransportPoolSnapshotForTest(proxyURL string) []int {
-	pool := globalProxyTransportPools.pool(proxyURL)
+	globalProxyTransportPools.mu.Lock()
+	pool := globalProxyTransportPools.pools[proxyURL]
+	globalProxyTransportPools.mu.Unlock()
+	if pool == nil {
+		return nil
+	}
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
 
@@ -354,4 +362,48 @@ func proxyTransportPoolSnapshotForTest(proxyURL string) []int {
 		active[i] = transport.active
 	}
 	return active
+}
+
+func TestProxyTransportPoolEvictsIdleTransport(t *testing.T) {
+	resetProxyTransportPoolsForTest()
+
+	proxy := newTestHTTPProxy(t, nil)
+	client := NewProxyAwareHTTPClient(
+		context.Background(),
+		&config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: proxy.URL}},
+		nil,
+		0,
+	)
+
+	resp, err := client.Get("http://upstream.example.test/idle-evict")
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	closeResponseBody(t, resp)
+
+	snapshot := proxyTransportPoolSnapshotForTest(proxy.URL)
+	if len(snapshot) != 1 || snapshot[0] != 0 {
+		t.Fatalf("active snapshot before eviction = %v, want [0]", snapshot)
+	}
+
+	evicted := globalProxyTransportPools.evictIdleTransports(time.Now().Add(proxyPoolIdleTTL), proxyPoolIdleTTL)
+	if evicted != 1 {
+		t.Fatalf("evicted = %d, want 1", evicted)
+	}
+
+	snapshot = proxyTransportPoolSnapshotForTest(proxy.URL)
+	if len(snapshot) != 0 {
+		t.Fatalf("active snapshot after eviction = %v, want empty", snapshot)
+	}
+
+	resp, err = client.Get("http://upstream.example.test/idle-evict-2")
+	if err != nil {
+		t.Fatalf("second Get() error = %v", err)
+	}
+	defer closeResponseBody(t, resp)
+
+	snapshot = proxyTransportPoolSnapshotForTest(proxy.URL)
+	if len(snapshot) != 1 || snapshot[0] != 1 {
+		t.Fatalf("active snapshot after recreation = %v, want [1]", snapshot)
+	}
 }
