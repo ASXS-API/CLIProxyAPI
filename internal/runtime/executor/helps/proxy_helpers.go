@@ -13,8 +13,8 @@ import (
 )
 
 // NewProxyAwareHTTPClient creates an HTTP client with proper proxy configuration priority:
-// 1. Use auth.ProxyURL if configured (highest priority)
-// 2. Use cfg.ProxyURL if auth proxy is not configured
+// 1. Use auth.ProxyURL if configured (highest priority, isolated per client)
+// 2. Use pooled cfg.ProxyURL transport if auth proxy is not configured
 // 3. Use RoundTripper from context if neither are configured
 //
 // Parameters:
@@ -31,34 +31,44 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		httpClient.Timeout = timeout
 	}
 
-	// Priority 1: Use auth.ProxyURL if configured
-	var proxyURL string
+	provider := proxyReuseProvider(auth)
+
+	// Priority 1: auth.ProxyURL remains isolated and never uses the global pool.
 	if auth != nil {
-		proxyURL = strings.TrimSpace(auth.ProxyURL)
-	}
-
-	// Priority 2: Use cfg.ProxyURL if auth proxy is not configured
-	if proxyURL == "" && cfg != nil {
-		proxyURL = strings.TrimSpace(cfg.ProxyURL)
-	}
-
-	// If we have a proxy URL configured, set up the transport
-	if proxyURL != "" {
-		transport := buildProxyTransport(proxyURL)
-		if transport != nil {
-			httpClient.Transport = transport
+		authProxyURL := strings.TrimSpace(auth.ProxyURL)
+		if authProxyURL != "" {
+			if transport := buildProxyTransport(authProxyURL); transport != nil {
+				httpClient.Transport = newInactiveProxyReuseRoundTripper(ctx, transport, provider, proxyReuseReasonAuthProxy)
+				return httpClient
+			}
+			httpClient.Transport = newInactiveProxyReuseRoundTripper(ctx, roundTripperFromContext(ctx), provider, proxyReuseReasonBuildFailed)
 			return httpClient
 		}
-		// If proxy setup failed, log and fall through to context RoundTripper
-		log.Debugf("failed to setup proxy from URL: %s, falling back to context transport", proxyURL)
+	}
+
+	// Priority 2: cfg.ProxyURL uses the global transport pool.
+	if cfg != nil {
+		cfgProxyURL := strings.TrimSpace(cfg.ProxyURL)
+		if cfgProxyURL != "" {
+			httpClient.Transport = newProxyPoolRoundTripper(ctx, cfgProxyURL, provider, roundTripperFromContext(ctx))
+			return httpClient
+		}
 	}
 
 	// Priority 3: Use RoundTripper from context (typically from RoundTripperFor)
-	if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
-		httpClient.Transport = rt
-	}
+	httpClient.Transport = newInactiveProxyReuseRoundTripper(ctx, roundTripperFromContext(ctx), provider, proxyReuseReasonNoProxy)
 
 	return httpClient
+}
+
+func roundTripperFromContext(ctx context.Context) http.RoundTripper {
+	if ctx == nil {
+		return nil
+	}
+	if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
+		return rt
+	}
+	return nil
 }
 
 // buildProxyTransport creates an HTTP transport configured for the given proxy URL.
