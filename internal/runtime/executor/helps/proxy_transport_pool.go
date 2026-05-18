@@ -89,7 +89,6 @@ type proxyTransportPool struct {
 
 type pooledProxyTransport struct {
 	id        uint64
-	index     int
 	transport http.RoundTripper
 	active    int
 	lastUsed  time.Time
@@ -98,6 +97,7 @@ type pooledProxyTransport struct {
 type proxyTransportLease struct {
 	transport      *pooledProxyTransport
 	streamID       uint64
+	poolSize       int
 	acquiredActive int
 	acquiredAt     time.Time
 	released       atomic.Bool
@@ -125,7 +125,6 @@ func (p *proxyTransportPool) acquire() (*proxyTransportLease, error) {
 
 	pooled := &pooledProxyTransport{
 		id:        globalProxyTransportID.Add(1),
-		index:     len(p.transports) + 1,
 		transport: transport,
 		lastUsed:  time.Now(),
 	}
@@ -139,10 +138,17 @@ func (p *proxyTransportPool) acquireLocked(transport *pooledProxyTransport) *pro
 	return &proxyTransportLease{
 		transport:      transport,
 		streamID:       globalProxyStreamID.Add(1),
+		poolSize:       len(p.transports),
 		acquiredActive: transport.active,
 		acquiredAt:     time.Now(),
 		pool:           p,
 	}
+}
+
+func (p *proxyTransportPool) size() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.transports)
 }
 
 func (l *proxyTransportLease) release(ctx context.Context, status string, err error) {
@@ -180,7 +186,6 @@ func (p *proxyTransportPool) evictIdle(now time.Time, idleFor time.Duration) int
 			evicted = append(evicted, transport.transport)
 			continue
 		}
-		transport.index = len(kept) + 1
 		kept = append(kept, transport)
 	}
 	p.transports = kept
@@ -221,6 +226,7 @@ func (rt *proxyPoolRoundTripper) RoundTrip(req *http.Request) (*http.Response, e
 	if errAcquire != nil {
 		reason := proxyReuseReasonBuildFailed
 		var base http.RoundTripper
+		poolSize := rt.pool.size()
 		if errors.Is(errAcquire, errProxyPoolFull) {
 			reason = proxyReuseReasonPoolFull
 			base = buildProxyTransport(rt.proxyURL)
@@ -228,7 +234,7 @@ func (rt *proxyPoolRoundTripper) RoundTrip(req *http.Request) (*http.Response, e
 		if base == nil {
 			base = rt.fallbackRT
 		}
-		return roundTripInactive(rt.ctx, req, base, rt.provider, reason)
+		return roundTripInactive(rt.ctx, req, base, rt.provider, reason, poolSize)
 	}
 
 	resp, errRoundTrip := lease.transport.transport.RoundTrip(req)
@@ -257,15 +263,15 @@ func newInactiveProxyReuseRoundTripper(ctx context.Context, base http.RoundTripp
 }
 
 func (rt *inactiveProxyReuseRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	return roundTripInactive(rt.ctx, req, rt.base, rt.provider, rt.reason)
+	return roundTripInactive(rt.ctx, req, rt.base, rt.provider, rt.reason, 0)
 }
 
-func roundTripInactive(ctx context.Context, req *http.Request, base http.RoundTripper, provider, reason string) (*http.Response, error) {
+func roundTripInactive(ctx context.Context, req *http.Request, base http.RoundTripper, provider, reason string, poolSize int) (*http.Response, error) {
 	if base == nil {
 		base = http.DefaultTransport
 	}
 	resp, errRoundTrip := base.RoundTrip(req)
-	logProxyReuseInactive(ctx, req, resp, provider, reason)
+	logProxyReuseInactive(ctx, req, resp, provider, reason, poolSize)
 	return resp, errRoundTrip
 }
 
@@ -292,7 +298,7 @@ func logProxyReuseActive(ctx context.Context, req *http.Request, resp *http.Resp
 	LogWithRequestID(ctx).Infof(
 		"[REUSE ACTIVE tid=%d transport=%d/%d sid=%d stream=%d/%d] provider=%s host=%s%s",
 		lease.transport.id,
-		lease.transport.index,
+		lease.poolSize,
 		proxyPoolMaxTransports,
 		lease.streamID,
 		lease.acquiredActive,
@@ -303,9 +309,10 @@ func logProxyReuseActive(ctx context.Context, req *http.Request, resp *http.Resp
 	)
 }
 
-func logProxyReuseInactive(ctx context.Context, req *http.Request, resp *http.Response, provider, reason string) {
+func logProxyReuseInactive(ctx context.Context, req *http.Request, resp *http.Response, provider, reason string, poolSize int) {
 	LogWithRequestID(ctx).Infof(
-		"[REUSE INACTIVE tid=0 transport=0/%d sid=0 stream=0/%d reason=%s] provider=%s host=%s%s",
+		"[REUSE INACTIVE tid=0 transport=%d/%d sid=0 stream=0/%d reason=%s] provider=%s host=%s%s",
+		poolSize,
 		proxyPoolMaxTransports,
 		proxyPoolMaxActivePerTransport,
 		reason,
