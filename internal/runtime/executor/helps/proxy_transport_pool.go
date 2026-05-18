@@ -15,10 +15,11 @@ import (
 )
 
 const (
-	proxyPoolMaxTransports         = 32
-	proxyPoolMaxActivePerTransport = 32
-	proxyPoolIdleTTL               = 10 * time.Minute
-	proxyPoolIdleSweepInterval     = time.Minute
+	proxyPoolMaxTransports          = 64
+	proxyPoolMaxActivePerTransport  = 32
+	proxyPoolSoftActivePerTransport = 16
+	proxyPoolIdleTTL                = 10 * time.Minute
+	proxyPoolIdleSweepInterval      = time.Minute
 
 	proxyReuseReasonAuthProxy   = "auth_proxy"
 	proxyReuseReasonNoProxy     = "no_proxy"
@@ -108,28 +109,45 @@ func (p *proxyTransportPool) acquire() (*proxyTransportLease, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	for _, transport := range p.transports {
-		if transport.active < proxyPoolMaxActivePerTransport {
+	if transport := p.leastActiveLocked(proxyPoolSoftActivePerTransport); transport != nil {
+		return p.acquireLocked(transport), nil
+	}
+
+	if len(p.transports) < proxyPoolMaxTransports {
+		transport := buildProxyTransport(p.proxyURL)
+		if transport != nil {
+			pooled := &pooledProxyTransport{
+				id:        globalProxyTransportID.Add(1),
+				transport: transport,
+				lastUsed:  time.Now(),
+			}
+			p.transports = append(p.transports, pooled)
+			return p.acquireLocked(pooled), nil
+		}
+
+		if transport := p.leastActiveLocked(proxyPoolMaxActivePerTransport); transport != nil {
 			return p.acquireLocked(transport), nil
 		}
-	}
-
-	if len(p.transports) >= proxyPoolMaxTransports {
-		return nil, errProxyPoolFull
-	}
-
-	transport := buildProxyTransport(p.proxyURL)
-	if transport == nil {
 		return nil, errProxyBuildFailed
 	}
 
-	pooled := &pooledProxyTransport{
-		id:        globalProxyTransportID.Add(1),
-		transport: transport,
-		lastUsed:  time.Now(),
+	if transport := p.leastActiveLocked(proxyPoolMaxActivePerTransport); transport != nil {
+		return p.acquireLocked(transport), nil
 	}
-	p.transports = append(p.transports, pooled)
-	return p.acquireLocked(pooled), nil
+	return nil, errProxyPoolFull
+}
+
+func (p *proxyTransportPool) leastActiveLocked(limit int) *pooledProxyTransport {
+	var best *pooledProxyTransport
+	for _, transport := range p.transports {
+		if transport.active >= limit {
+			continue
+		}
+		if best == nil || transport.active < best.active {
+			best = transport
+		}
+	}
+	return best
 }
 
 func (p *proxyTransportPool) acquireLocked(transport *pooledProxyTransport) *proxyTransportLease {

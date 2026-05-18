@@ -114,7 +114,7 @@ func TestNewProxyAwareHTTPClientAuthProxyDoesNotUsePoolOrContextRoundTripper(t *
 	}
 }
 
-func TestProxyTransportPoolOpensSecondTransportAfterActiveLimit(t *testing.T) {
+func TestProxyTransportPoolOpensSecondTransportAfterSoftActiveLimit(t *testing.T) {
 	resetProxyTransportPoolsForTest()
 
 	proxy := newTestHTTPProxy(t, nil)
@@ -125,12 +125,12 @@ func TestProxyTransportPoolOpensSecondTransportAfterActiveLimit(t *testing.T) {
 		0,
 	)
 
-	responses := make([]*http.Response, 0, proxyPoolMaxActivePerTransport+1)
+	responses := make([]*http.Response, 0, proxyPoolSoftActivePerTransport+1)
 	t.Cleanup(func() {
 		closeResponses(t, responses)
 	})
 
-	for i := 0; i < proxyPoolMaxActivePerTransport+1; i++ {
+	for i := 0; i < proxyPoolSoftActivePerTransport+1; i++ {
 		resp, err := client.Get(fmt.Sprintf("http://upstream.example.test/stream-%d", i))
 		if err != nil {
 			t.Fatalf("Get(%d) error = %v", i, err)
@@ -139,8 +139,8 @@ func TestProxyTransportPoolOpensSecondTransportAfterActiveLimit(t *testing.T) {
 	}
 
 	snapshot := proxyTransportPoolSnapshotForTest(proxy.URL)
-	if len(snapshot) != 2 || snapshot[0] != proxyPoolMaxActivePerTransport || snapshot[1] != 1 {
-		t.Fatalf("active snapshot = %v, want [%d 1]", snapshot, proxyPoolMaxActivePerTransport)
+	if len(snapshot) != 2 || snapshot[0] != proxyPoolSoftActivePerTransport || snapshot[1] != 1 {
+		t.Fatalf("active snapshot = %v, want [%d 1]", snapshot, proxyPoolSoftActivePerTransport)
 	}
 }
 
