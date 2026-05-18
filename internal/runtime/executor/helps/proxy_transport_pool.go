@@ -15,8 +15,8 @@ import (
 )
 
 const (
-	proxyPoolMaxTransports         = 32
-	proxyPoolMaxActivePerTransport = 32
+	proxyPoolMaxTransports         = 128
+	proxyPoolMaxActivePerTransport = 8
 	proxyPoolIdleTTL               = 10 * time.Minute
 	proxyPoolIdleSweepInterval     = time.Minute
 
