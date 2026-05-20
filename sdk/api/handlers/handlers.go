@@ -379,6 +379,11 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 			parentCtx = logging.WithRequestID(parentCtx, requestID)
 		}
 	}
+	if requestCtx != nil {
+		parentCtx = logging.WithUpstreamTTFBHolderFrom(parentCtx, requestCtx)
+	} else {
+		parentCtx = logging.WithUpstreamTTFBHolder(parentCtx)
+	}
 	newCtx, cancel := context.WithCancel(parentCtx)
 
 	endpoint := ""

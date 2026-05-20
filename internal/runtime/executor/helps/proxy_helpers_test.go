@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
@@ -52,6 +53,61 @@ func TestNewProxyAwareHTTPClientDirectBypassesGlobalProxy(t *testing.T) {
 	}
 	if snapshot := proxyTransportPoolSnapshotForTest(globalProxy.URL); len(snapshot) != 0 {
 		t.Fatalf("global proxy pool size = %d, want 0", len(snapshot))
+	}
+}
+
+func TestNewProxyAwareHTTPClientRecordsUpstreamTTFB(t *testing.T) {
+	ctx := logging.WithUpstreamTTFBHolder(context.Background())
+	ctx = context.WithValue(ctx, "cliproxy.roundtripper", roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("ok")), Header: make(http.Header)}, nil
+	}))
+	client := NewProxyAwareHTTPClient(
+		ctx,
+		&config.Config{},
+		&cliproxyauth.Auth{Provider: "codex"},
+		0,
+	)
+
+	resp, err := client.Get("http://upstream.example.test/ttfb")
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	closeResponseBody(t, resp)
+
+	if got, ok := logging.GetUpstreamTTFB(ctx); !ok || got <= 0 {
+		t.Fatalf("upstream TTFB = %v, ok=%t; want positive duration", got, ok)
+	}
+}
+
+func TestUpstreamTTFBRoundTripperKeepsFirstAttempt(t *testing.T) {
+	ctx := logging.WithUpstreamTTFBHolder(context.Background())
+	rt := newUpstreamTTFBRoundTripper(ctx, roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		time.Sleep(time.Millisecond)
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("ok")), Header: make(http.Header)}, nil
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "http://upstream.example.test/first", nil)
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("first RoundTrip() error = %v", err)
+	}
+	closeResponseBody(t, resp)
+	first, ok := logging.GetUpstreamTTFB(ctx)
+	if !ok || first <= 0 {
+		t.Fatalf("first upstream TTFB = %v, ok=%t; want positive duration", first, ok)
+	}
+
+	resp, err = rt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("second RoundTrip() error = %v", err)
+	}
+	closeResponseBody(t, resp)
+	second, ok := logging.GetUpstreamTTFB(ctx)
+	if !ok {
+		t.Fatal("second upstream TTFB missing")
+	}
+	if second != first {
+		t.Fatalf("upstream TTFB changed after second attempt: first=%v second=%v", first, second)
 	}
 }
 

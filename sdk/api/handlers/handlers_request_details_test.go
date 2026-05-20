@@ -1,12 +1,16 @@
 package handlers
 
 import (
+	"context"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -135,5 +139,31 @@ func TestGetRequestDetails_ImageModelReturns503(t *testing.T) {
 	msg := errMsg.Error.Error()
 	if !strings.Contains(msg, "/v1/images/generations") || !strings.Contains(msg, "/v1/images/edits") {
 		t.Fatalf("unexpected error message: %q", msg)
+	}
+}
+
+func TestGetContextWithCancelSharesUpstreamTTFBHolder(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	req, err := http.NewRequest(http.MethodPost, "/v1/responses", nil)
+	if err != nil {
+		t.Fatalf("NewRequest error: %v", err)
+	}
+	requestCtx := logging.WithUpstreamTTFBHolder(req.Context())
+	c.Request = req.WithContext(requestCtx)
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, coreauth.NewManager(nil, nil, nil))
+	cliCtx, cancel := handler.GetContextWithCancel(nil, c, context.Background())
+	defer cancel()
+
+	logging.RecordUpstreamTTFB(cliCtx, 42*time.Millisecond)
+	got, ok := logging.GetUpstreamTTFB(c.Request.Context())
+	if !ok {
+		t.Fatal("request context missing upstream TTFB")
+	}
+	if got != 42*time.Millisecond {
+		t.Fatalf("upstream TTFB = %v, want 42ms", got)
 	}
 }

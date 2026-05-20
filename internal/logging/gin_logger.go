@@ -6,6 +6,7 @@ package logging
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"runtime/debug"
 	"strings"
@@ -53,6 +54,7 @@ func GinLogrusLogger() gin.HandlerFunc {
 			requestID = GenerateRequestID()
 			SetGinRequestID(c, requestID)
 			ctx := WithRequestID(c.Request.Context(), requestID)
+			ctx = WithUpstreamTTFBHolder(ctx)
 			c.Request = c.Request.WithContext(ctx)
 		}
 
@@ -77,11 +79,15 @@ func GinLogrusLogger() gin.HandlerFunc {
 		clientIP := c.ClientIP()
 		method := c.Request.Method
 		errorMessage := c.Errors.ByType(gin.ErrorTypePrivate).String()
+		ttfb := "TTFB -"
+		if upstreamTTFB, ok := GetUpstreamTTFB(c.Request.Context()); ok {
+			ttfb = "TTFB " + formatTTFBDuration(upstreamTTFB)
+		}
 
 		if requestID == "" {
 			requestID = "--------"
 		}
-		logLine := fmt.Sprintf("%3d | %13v | %15s | %-7s \"%s\"", statusCode, latency, clientIP, method, path)
+		logLine := fmt.Sprintf("%3d | %13v | %-13s | %15s | %-7s \"%s\"", statusCode, latency, ttfb, clientIP, method, path)
 		if creditsUsed(c) {
 			logLine += " [credits]"
 		}
@@ -100,6 +106,24 @@ func GinLogrusLogger() gin.HandlerFunc {
 			entry.Info(logLine)
 		}
 	}
+}
+
+func formatTTFBDuration(duration time.Duration) string {
+	if duration <= 0 {
+		return "-"
+	}
+	if duration >= time.Second {
+		return fmt.Sprintf("%.2fs", roundFloat(duration.Seconds(), 2))
+	}
+	if duration >= time.Millisecond {
+		return fmt.Sprintf("%.2fms", roundFloat(float64(duration)/float64(time.Millisecond), 2))
+	}
+	return fmt.Sprintf("%.2fus", roundFloat(float64(duration)/float64(time.Microsecond), 2))
+}
+
+func roundFloat(value float64, precision int) float64 {
+	scale := math.Pow10(precision)
+	return math.Round(value*scale) / scale
 }
 
 // isAIAPIPath checks if the given path is an AI API endpoint that should have request ID tracking.

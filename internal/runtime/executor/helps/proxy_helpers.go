@@ -3,10 +3,12 @@ package helps
 import (
 	"context"
 	"net/http"
+	"net/http/httptrace"
 	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
@@ -38,10 +40,10 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		authProxyURL := strings.TrimSpace(auth.ProxyURL)
 		if authProxyURL != "" {
 			if transport := buildProxyTransport(authProxyURL); transport != nil {
-				httpClient.Transport = newInactiveProxyReuseRoundTripper(ctx, transport, provider, proxyReuseReasonAuthProxy)
+				httpClient.Transport = newUpstreamTTFBRoundTripper(ctx, newInactiveProxyReuseRoundTripper(ctx, transport, provider, proxyReuseReasonAuthProxy))
 				return httpClient
 			}
-			httpClient.Transport = newInactiveProxyReuseRoundTripper(ctx, roundTripperFromContext(ctx), provider, proxyReuseReasonBuildFailed)
+			httpClient.Transport = newUpstreamTTFBRoundTripper(ctx, newInactiveProxyReuseRoundTripper(ctx, roundTripperFromContext(ctx), provider, proxyReuseReasonBuildFailed))
 			return httpClient
 		}
 	}
@@ -50,15 +52,53 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	if cfg != nil {
 		cfgProxyURL := strings.TrimSpace(cfg.ProxyURL)
 		if cfgProxyURL != "" {
-			httpClient.Transport = newProxyPoolRoundTripper(ctx, cfgProxyURL, provider, roundTripperFromContext(ctx))
+			httpClient.Transport = newUpstreamTTFBRoundTripper(ctx, newProxyPoolRoundTripper(ctx, cfgProxyURL, provider, roundTripperFromContext(ctx)))
 			return httpClient
 		}
 	}
 
 	// Priority 3: Use RoundTripper from context (typically from RoundTripperFor)
-	httpClient.Transport = newInactiveProxyReuseRoundTripper(ctx, roundTripperFromContext(ctx), provider, proxyReuseReasonNoProxy)
+	httpClient.Transport = newUpstreamTTFBRoundTripper(ctx, newInactiveProxyReuseRoundTripper(ctx, roundTripperFromContext(ctx), provider, proxyReuseReasonNoProxy))
 
 	return httpClient
+}
+
+type upstreamTTFBRoundTripper struct {
+	ctx  context.Context
+	base http.RoundTripper
+}
+
+func newUpstreamTTFBRoundTripper(ctx context.Context, base http.RoundTripper) http.RoundTripper {
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return &upstreamTTFBRoundTripper{ctx: ctx, base: base}
+}
+
+func (rt *upstreamTTFBRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if rt == nil {
+		return http.DefaultTransport.RoundTrip(req)
+	}
+	base := rt.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	if req == nil {
+		return base.RoundTrip(req)
+	}
+
+	start := time.Now()
+	trace := &httptrace.ClientTrace{
+		GotFirstResponseByte: func() {
+			logging.RecordUpstreamTTFB(rt.ctx, time.Since(start))
+		},
+	}
+	tracedReq := req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+	resp, err := base.RoundTrip(tracedReq)
+	if err == nil && resp != nil {
+		logging.RecordUpstreamTTFB(rt.ctx, time.Since(start))
+	}
+	return resp, err
 }
 
 func roundTripperFromContext(ctx context.Context) http.RoundTripper {
