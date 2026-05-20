@@ -18,6 +18,7 @@ const (
 	proxyPoolMaxTransports          = 64
 	proxyPoolMaxActivePerTransport  = 32
 	proxyPoolSoftActivePerTransport = 16
+	proxyPoolMaxLifetime            = 10 * time.Minute
 	proxyPoolIdleTTL                = 10 * time.Minute
 	proxyPoolIdleSweepInterval      = time.Minute
 
@@ -92,6 +93,7 @@ type pooledProxyTransport struct {
 	id        uint64
 	transport http.RoundTripper
 	active    int
+	createdAt time.Time
 	lastUsed  time.Time
 }
 
@@ -101,16 +103,22 @@ type proxyTransportLease struct {
 	poolSize       int
 	acquiredActive int
 	acquiredAt     time.Time
+	acquiredAge    time.Duration
 	released       atomic.Bool
 	pool           *proxyTransportPool
 }
 
-func (p *proxyTransportPool) acquire() (*proxyTransportLease, error) {
+func (p *proxyTransportPool) acquire(ctx context.Context) (*proxyTransportLease, error) {
+	now := time.Now()
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	evicted := p.evictExpiredIdleLocked(ctx, now)
+	defer func() {
+		p.mu.Unlock()
+		closeIdleConnectionsFor(evicted)
+	}()
 
-	if transport := p.leastActiveLocked(proxyPoolSoftActivePerTransport); transport != nil {
-		return p.acquireLocked(transport), nil
+	if transport := p.leastActiveLocked(proxyPoolSoftActivePerTransport, now); transport != nil {
+		return p.acquireLocked(transport, now), nil
 	}
 
 	if len(p.transports) < proxyPoolMaxTransports {
@@ -119,28 +127,29 @@ func (p *proxyTransportPool) acquire() (*proxyTransportLease, error) {
 			pooled := &pooledProxyTransport{
 				id:        globalProxyTransportID.Add(1),
 				transport: transport,
-				lastUsed:  time.Now(),
+				createdAt: now,
+				lastUsed:  now,
 			}
 			p.transports = append(p.transports, pooled)
-			return p.acquireLocked(pooled), nil
+			return p.acquireLocked(pooled, now), nil
 		}
 
-		if transport := p.leastActiveLocked(proxyPoolMaxActivePerTransport); transport != nil {
-			return p.acquireLocked(transport), nil
+		if transport := p.leastActiveLocked(proxyPoolMaxActivePerTransport, now); transport != nil {
+			return p.acquireLocked(transport, now), nil
 		}
 		return nil, errProxyBuildFailed
 	}
 
-	if transport := p.leastActiveLocked(proxyPoolMaxActivePerTransport); transport != nil {
-		return p.acquireLocked(transport), nil
+	if transport := p.leastActiveLocked(proxyPoolMaxActivePerTransport, now); transport != nil {
+		return p.acquireLocked(transport, now), nil
 	}
 	return nil, errProxyPoolFull
 }
 
-func (p *proxyTransportPool) leastActiveLocked(limit int) *pooledProxyTransport {
+func (p *proxyTransportPool) leastActiveLocked(limit int, now time.Time) *pooledProxyTransport {
 	var best *pooledProxyTransport
 	for _, transport := range p.transports {
-		if transport.active >= limit {
+		if transport.active >= limit || transport.expired(now) {
 			continue
 		}
 		if best == nil || proxyPoolSoftDistance(transport.active) < proxyPoolSoftDistance(best.active) {
@@ -158,15 +167,20 @@ func proxyPoolSoftDistance(active int) int {
 	return distance
 }
 
-func (p *proxyTransportPool) acquireLocked(transport *pooledProxyTransport) *proxyTransportLease {
+func (transport *pooledProxyTransport) expired(now time.Time) bool {
+	return !transport.createdAt.IsZero() && now.Sub(transport.createdAt) >= proxyPoolMaxLifetime
+}
+
+func (p *proxyTransportPool) acquireLocked(transport *pooledProxyTransport, now time.Time) *proxyTransportLease {
 	transport.active++
-	transport.lastUsed = time.Now()
+	transport.lastUsed = now
 	return &proxyTransportLease{
 		transport:      transport,
 		streamID:       globalProxyStreamID.Add(1),
 		poolSize:       len(p.transports),
 		acquiredActive: transport.active,
-		acquiredAt:     time.Now(),
+		acquiredAt:     now,
+		acquiredAge:    now.Sub(transport.createdAt),
 		pool:           p,
 	}
 }
@@ -182,50 +196,110 @@ func (l *proxyTransportLease) release(ctx context.Context, status string, err er
 		return
 	}
 
+	now := time.Now()
+	var evicted http.RoundTripper
+	var expired bool
 	l.pool.mu.Lock()
 	l.transport.active--
 	active := l.transport.active
-	l.transport.lastUsed = time.Now()
+	age := now.Sub(l.transport.createdAt)
+	l.transport.lastUsed = now
+	if active == 0 && l.transport.expired(now) {
+		expired = true
+		evicted = l.pool.removeTransportLocked(l.transport)
+	}
+	poolSize := len(l.pool.transports)
 	l.pool.mu.Unlock()
+	closeIdleConnections(evicted)
 
 	entry := LogWithRequestID(ctx)
 	if err != nil {
 		entry = entry.WithError(err)
 	}
 	entry.Debugf(
-		"[REUSE RELEASE tid=%d sid=%d duration=%s active=%d/%d status=%s]",
+		"[REUSE RELEASE tid=%d sid=%d duration=%s age=%s active=%d/%d status=%s]",
 		l.transport.id,
 		l.streamID,
 		time.Since(l.acquiredAt).Truncate(time.Millisecond),
+		age.Truncate(time.Millisecond),
 		active,
 		proxyPoolMaxActivePerTransport,
 		status,
 	)
+	if expired {
+		logProxyReuseExpired(ctx, l.transport, age, active, poolSize, "max_lifetime")
+	}
 }
 
 func (p *proxyTransportPool) evictIdle(now time.Time, idleFor time.Duration) int {
 	p.mu.Lock()
+	evicted := p.evictIdleLocked(now, idleFor)
+	p.mu.Unlock()
+
+	closeIdleConnectionsFor(evicted)
+	return len(evicted)
+}
+
+func (p *proxyTransportPool) evictIdleLocked(now time.Time, idleFor time.Duration) []http.RoundTripper {
 	kept := p.transports[:0]
 	evicted := make([]http.RoundTripper, 0)
+	expired := make([]*pooledProxyTransport, 0)
 	for _, transport := range p.transports {
-		if transport.active == 0 && now.Sub(transport.lastUsed) >= idleFor {
+		if transport.active == 0 && (now.Sub(transport.lastUsed) >= idleFor || transport.expired(now)) {
 			evicted = append(evicted, transport.transport)
+			if transport.expired(now) {
+				expired = append(expired, transport)
+			}
 			continue
 		}
 		kept = append(kept, transport)
 	}
 	p.transports = kept
-	p.mu.Unlock()
-
-	for _, transport := range evicted {
-		closeIdleConnections(transport)
+	for _, transport := range expired {
+		logProxyReuseExpired(context.Background(), transport, now.Sub(transport.createdAt), transport.active, len(p.transports), "janitor_max_lifetime")
 	}
-	return len(evicted)
+	return evicted
+}
+
+func (p *proxyTransportPool) evictExpiredIdleLocked(ctx context.Context, now time.Time) []http.RoundTripper {
+	kept := p.transports[:0]
+	evicted := make([]http.RoundTripper, 0)
+	expired := make([]*pooledProxyTransport, 0)
+	for _, transport := range p.transports {
+		if transport.active == 0 && transport.expired(now) {
+			evicted = append(evicted, transport.transport)
+			expired = append(expired, transport)
+			continue
+		}
+		kept = append(kept, transport)
+	}
+	p.transports = kept
+	for _, transport := range expired {
+		logProxyReuseExpired(ctx, transport, now.Sub(transport.createdAt), transport.active, len(p.transports), "max_lifetime")
+	}
+	return evicted
+}
+
+func (p *proxyTransportPool) removeTransportLocked(target *pooledProxyTransport) http.RoundTripper {
+	for i, transport := range p.transports {
+		if transport != target {
+			continue
+		}
+		p.transports = append(p.transports[:i], p.transports[i+1:]...)
+		return transport.transport
+	}
+	return nil
 }
 
 func closeIdleConnections(transport http.RoundTripper) {
 	if closer, ok := transport.(interface{ CloseIdleConnections() }); ok {
 		closer.CloseIdleConnections()
+	}
+}
+
+func closeIdleConnectionsFor(transports []http.RoundTripper) {
+	for _, transport := range transports {
+		closeIdleConnections(transport)
 	}
 }
 
@@ -248,7 +322,7 @@ func newProxyPoolRoundTripper(ctx context.Context, proxyURL, provider string, fa
 }
 
 func (rt *proxyPoolRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	lease, errAcquire := rt.pool.acquire()
+	lease, errAcquire := rt.pool.acquire(rt.ctx)
 	if errAcquire != nil {
 		reason := proxyReuseReasonBuildFailed
 		var base http.RoundTripper
@@ -322,16 +396,33 @@ func (b *proxyReuseTrackedBody) Close() error {
 
 func logProxyReuseActive(ctx context.Context, req *http.Request, resp *http.Response, provider string, lease *proxyTransportLease) {
 	LogWithRequestID(ctx).Infof(
-		"[REUSE ACTIVE tid=%d transport=%d/%d sid=%d stream=%d/%d] provider=%s host=%s%s",
+		"[REUSE ACTIVE tid=%d transport=%d/%d sid=%d stream=%d/%d age=%s] provider=%s host=%s%s",
 		lease.transport.id,
 		lease.poolSize,
 		proxyPoolMaxTransports,
 		lease.streamID,
 		lease.acquiredActive,
 		proxyPoolMaxActivePerTransport,
+		lease.acquiredAge.Truncate(time.Millisecond),
 		provider,
 		proxyReuseHost(req),
 		proxyReuseProto(resp),
+	)
+}
+
+func logProxyReuseExpired(ctx context.Context, transport *pooledProxyTransport, age time.Duration, active int, poolSize int, reason string) {
+	if transport == nil {
+		return
+	}
+	LogWithRequestID(ctx).Infof(
+		"[REUSE EXPIRE tid=%d transport=%d/%d age=%s active=%d/%d reason=%s]",
+		transport.id,
+		poolSize,
+		proxyPoolMaxTransports,
+		age.Truncate(time.Millisecond),
+		active,
+		proxyPoolMaxActivePerTransport,
+		reason,
 	)
 }
 

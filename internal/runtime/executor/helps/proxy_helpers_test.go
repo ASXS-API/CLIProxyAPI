@@ -161,7 +161,7 @@ func TestProxyTransportPoolSelectsTransportClosestToSoftActiveLimit(t *testing.T
 		},
 	}
 
-	lease, err := pool.acquire()
+	lease, err := pool.acquire(context.Background())
 	if err != nil {
 		t.Fatalf("acquire() error = %v", err)
 	}
@@ -171,6 +171,51 @@ func TestProxyTransportPoolSelectsTransportClosestToSoftActiveLimit(t *testing.T
 	}
 	if lease.acquiredActive != proxyPoolSoftActivePerTransport {
 		t.Fatalf("acquired active = %d, want %d", lease.acquiredActive, proxyPoolSoftActivePerTransport)
+	}
+}
+
+func TestProxyTransportPoolSkipsExpiredTransport(t *testing.T) {
+	resetProxyTransportPoolsForTest()
+
+	now := time.Now()
+	pool := &proxyTransportPool{
+		transports: []*pooledProxyTransport{
+			{id: 1, transport: staticRoundTripper{}, active: proxyPoolSoftActivePerTransport - 1, createdAt: now.Add(-proxyPoolMaxLifetime)},
+			{id: 2, transport: staticRoundTripper{}, active: 0, createdAt: now},
+		},
+	}
+
+	lease, err := pool.acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire() error = %v", err)
+	}
+
+	if lease.transport.id != 2 {
+		t.Fatalf("selected transport id = %d, want 2", lease.transport.id)
+	}
+	snapshot := proxyTransportPoolSnapshotForPoolForTest(pool)
+	if len(snapshot) != 2 || snapshot[0] != proxyPoolSoftActivePerTransport-1 || snapshot[1] != 1 {
+		t.Fatalf("active snapshot = %v, want [%d 1]", snapshot, proxyPoolSoftActivePerTransport-1)
+	}
+}
+
+func TestProxyTransportPoolRemovesExpiredTransportAfterRelease(t *testing.T) {
+	resetProxyTransportPoolsForTest()
+
+	transport := &pooledProxyTransport{
+		id:        1,
+		transport: staticRoundTripper{},
+		active:    1,
+		createdAt: time.Now().Add(-proxyPoolMaxLifetime),
+	}
+	pool := &proxyTransportPool{transports: []*pooledProxyTransport{transport}}
+	lease := &proxyTransportLease{transport: transport, pool: pool}
+
+	lease.release(context.Background(), "close", nil)
+
+	snapshot := proxyTransportPoolSnapshotForPoolForTest(pool)
+	if len(snapshot) != 0 {
+		t.Fatalf("active snapshot after release = %v, want empty", snapshot)
 	}
 }
 
@@ -384,6 +429,10 @@ func proxyTransportPoolSnapshotForTest(proxyURL string) []int {
 	if pool == nil {
 		return nil
 	}
+	return proxyTransportPoolSnapshotForPoolForTest(pool)
+}
+
+func proxyTransportPoolSnapshotForPoolForTest(pool *proxyTransportPool) []int {
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
 
