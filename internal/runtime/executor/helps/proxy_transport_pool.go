@@ -143,11 +143,19 @@ func (p *proxyTransportPool) leastActiveLocked(limit int) *pooledProxyTransport 
 		if transport.active >= limit {
 			continue
 		}
-		if best == nil || transport.active < best.active {
+		if best == nil || proxyPoolSoftDistance(transport.active) < proxyPoolSoftDistance(best.active) {
 			best = transport
 		}
 	}
 	return best
+}
+
+func proxyPoolSoftDistance(active int) int {
+	distance := active - proxyPoolSoftActivePerTransport
+	if distance < 0 {
+		return -distance
+	}
+	return distance
 }
 
 func (p *proxyTransportPool) acquireLocked(transport *pooledProxyTransport) *proxyTransportLease {

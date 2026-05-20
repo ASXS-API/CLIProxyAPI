@@ -18,6 +18,12 @@ import (
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
 
+type staticRoundTripper struct{}
+
+func (staticRoundTripper) RoundTrip(_ *http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("ok"))}, nil
+}
+
 func TestNewProxyAwareHTTPClientDirectBypassesGlobalProxy(t *testing.T) {
 	resetProxyTransportPoolsForTest()
 
@@ -141,6 +147,30 @@ func TestProxyTransportPoolOpensSecondTransportAfterSoftActiveLimit(t *testing.T
 	snapshot := proxyTransportPoolSnapshotForTest(proxy.URL)
 	if len(snapshot) != 2 || snapshot[0] != proxyPoolSoftActivePerTransport || snapshot[1] != 1 {
 		t.Fatalf("active snapshot = %v, want [%d 1]", snapshot, proxyPoolSoftActivePerTransport)
+	}
+}
+
+func TestProxyTransportPoolSelectsTransportClosestToSoftActiveLimit(t *testing.T) {
+	resetProxyTransportPoolsForTest()
+
+	pool := &proxyTransportPool{
+		transports: []*pooledProxyTransport{
+			{id: 1, transport: staticRoundTripper{}, active: 0},
+			{id: 2, transport: staticRoundTripper{}, active: proxyPoolSoftActivePerTransport - 1},
+			{id: 3, transport: staticRoundTripper{}, active: proxyPoolSoftActivePerTransport - 3},
+		},
+	}
+
+	lease, err := pool.acquire()
+	if err != nil {
+		t.Fatalf("acquire() error = %v", err)
+	}
+
+	if lease.transport.id != 2 {
+		t.Fatalf("selected transport id = %d, want 2", lease.transport.id)
+	}
+	if lease.acquiredActive != proxyPoolSoftActivePerTransport {
+		t.Fatalf("acquired active = %d, want %d", lease.acquiredActive, proxyPoolSoftActivePerTransport)
 	}
 }
 
