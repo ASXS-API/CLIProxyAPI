@@ -176,10 +176,10 @@ func NewUtlsHTTPClient(cfg *config.Config, auth *cliproxyauth.Auth, timeout time
 	}
 
 	client := &http.Client{
-		Transport: &fallbackRoundTripper{
+		Transport: newResponseHeaderRetryRoundTripper(&fallbackRoundTripper{
 			utls:     utlsRT,
 			fallback: standardTransport,
-		},
+		}, cfg, proxyReuseProvider(auth)),
 	}
 	if timeout > 0 {
 		client.Timeout = timeout

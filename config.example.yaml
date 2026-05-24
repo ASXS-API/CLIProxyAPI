@@ -100,6 +100,13 @@ max-retry-credentials: 0
 # Numeric values are seconds; duration strings like 300ms are also supported.
 max-retry-interval: 30
 
+# When enabled, retry if the upstream accepts the full request body but does not
+# return response headers in time. Attempts use 10s, 20s, 40s, then 80s by default.
+upstream-response-header-timeout:
+  enabled: false
+  initial: 10
+  max: 80
+
 # When true, disable auth/model cooldown scheduling globally (prevents blackout windows after failure states).
 disable-cooling: false
 

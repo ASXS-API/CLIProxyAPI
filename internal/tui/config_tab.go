@@ -219,7 +219,11 @@ func configFieldEditValue(f configField) string {
 }
 
 func retryIntervalDisplayValue(cfg map[string]any) string {
-	value, ok := cfg["max-retry-interval"]
+	return durationDisplayValue(cfg, "max-retry-interval")
+}
+
+func durationDisplayValue(cfg map[string]any, key string) string {
+	value, ok := cfg[key]
 	if !ok {
 		return "0"
 	}
@@ -364,6 +368,11 @@ func (m configTabModel) parseConfig(cfg map[string]any) []configField {
 	fields = append(fields, configField{"Proxy URL", "proxy-url", "string", getString(cfg, "proxy-url"), nil})
 	fields = append(fields, configField{"Request Retry", "request-retry", "int", fmt.Sprintf("%.0f", getFloat(cfg, "request-retry")), nil})
 	fields = append(fields, configField{"Max Retry Interval", "max-retry-interval", "duration", retryIntervalDisplayValue(cfg), nil})
+	if upstreamTimeout, ok := cfg["upstream-response-header-timeout"].(map[string]any); ok {
+		fields = append(fields, configField{"Upstream Header Timeout", "upstream-response-header-timeout/enabled", "bool", fmt.Sprintf("%v", getBool(upstreamTimeout, "enabled")), nil})
+		fields = append(fields, configField{"Upstream Header Initial", "upstream-response-header-timeout/initial", "duration", durationDisplayValue(upstreamTimeout, "initial"), nil})
+		fields = append(fields, configField{"Upstream Header Max", "upstream-response-header-timeout/max", "duration", durationDisplayValue(upstreamTimeout, "max"), nil})
+	}
 	fields = append(fields, configField{"Force Model Prefix", "force-model-prefix", "string", getString(cfg, "force-model-prefix"), nil})
 
 	// Logging
@@ -410,7 +419,8 @@ func fieldSection(apiPath string) string {
 		return T("section_routing")
 	}
 	switch apiPath {
-	case "port", "host", "debug", "proxy-url", "request-retry", "max-retry-interval", "force-model-prefix":
+	case "port", "host", "debug", "proxy-url", "request-retry", "max-retry-interval", "force-model-prefix",
+		"upstream-response-header-timeout/enabled", "upstream-response-header-timeout/initial", "upstream-response-header-timeout/max":
 		return T("section_server")
 	case "logging-to-file", "logs-max-total-size-mb", "error-logs-max-files", "usage-statistics-enabled", "request-log":
 		return T("section_logging")

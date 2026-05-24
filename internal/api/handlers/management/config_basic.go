@@ -279,6 +279,62 @@ func (h *Handler) PutMaxRetryInterval(c *gin.Context) {
 	h.persist(c)
 }
 
+// Upstream response header timeout
+func (h *Handler) GetUpstreamResponseHeaderTimeout(c *gin.Context) {
+	c.JSON(200, gin.H{"upstream-response-header-timeout": h.cfg.UpstreamResponseHeaderTimeout})
+}
+func (h *Handler) PutUpstreamResponseHeaderTimeout(c *gin.Context) {
+	var body struct {
+		Value *config.UpstreamResponseHeaderTimeoutConfig `json:"value"`
+	}
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	h.cfg.UpstreamResponseHeaderTimeout = *body.Value
+	h.cfg.SanitizeUpstreamResponseHeaderTimeout()
+	h.persist(c)
+}
+func (h *Handler) GetUpstreamResponseHeaderTimeoutEnabled(c *gin.Context) {
+	c.JSON(200, gin.H{"enabled": h.cfg.UpstreamResponseHeaderTimeout.Enabled})
+}
+func (h *Handler) PutUpstreamResponseHeaderTimeoutEnabled(c *gin.Context) {
+	h.updateBoolField(c, func(v bool) {
+		h.cfg.UpstreamResponseHeaderTimeout.Enabled = v
+		h.cfg.SanitizeUpstreamResponseHeaderTimeout()
+	})
+}
+func (h *Handler) GetUpstreamResponseHeaderTimeoutInitial(c *gin.Context) {
+	c.JSON(200, gin.H{"initial": h.cfg.UpstreamResponseHeaderTimeout.Initial})
+}
+func (h *Handler) PutUpstreamResponseHeaderTimeoutInitial(c *gin.Context) {
+	var body struct {
+		Value *config.RetryIntervalSeconds `json:"value"`
+	}
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	h.cfg.UpstreamResponseHeaderTimeout.Initial = *body.Value
+	h.cfg.SanitizeUpstreamResponseHeaderTimeout()
+	h.persist(c)
+}
+func (h *Handler) GetUpstreamResponseHeaderTimeoutMax(c *gin.Context) {
+	c.JSON(200, gin.H{"max": h.cfg.UpstreamResponseHeaderTimeout.Max})
+}
+func (h *Handler) PutUpstreamResponseHeaderTimeoutMax(c *gin.Context) {
+	var body struct {
+		Value *config.RetryIntervalSeconds `json:"value"`
+	}
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	h.cfg.UpstreamResponseHeaderTimeout.Max = *body.Value
+	h.cfg.SanitizeUpstreamResponseHeaderTimeout()
+	h.persist(c)
+}
+
 // ForceModelPrefix
 func (h *Handler) GetForceModelPrefix(c *gin.Context) {
 	c.JSON(200, gin.H{"force-model-prefix": h.cfg.ForceModelPrefix})

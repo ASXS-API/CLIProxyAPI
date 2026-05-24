@@ -40,10 +40,10 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		authProxyURL := strings.TrimSpace(auth.ProxyURL)
 		if authProxyURL != "" {
 			if transport := buildProxyTransport(authProxyURL); transport != nil {
-				httpClient.Transport = newUpstreamTTFBRoundTripper(ctx, newInactiveProxyReuseRoundTripper(ctx, transport, provider, proxyReuseReasonAuthProxy))
+				httpClient.Transport = newConfiguredUpstreamRoundTripper(ctx, cfg, provider, newInactiveProxyReuseRoundTripper(ctx, transport, provider, proxyReuseReasonAuthProxy))
 				return httpClient
 			}
-			httpClient.Transport = newUpstreamTTFBRoundTripper(ctx, newInactiveProxyReuseRoundTripper(ctx, roundTripperFromContext(ctx), provider, proxyReuseReasonBuildFailed))
+			httpClient.Transport = newConfiguredUpstreamRoundTripper(ctx, cfg, provider, newInactiveProxyReuseRoundTripper(ctx, roundTripperFromContext(ctx), provider, proxyReuseReasonBuildFailed))
 			return httpClient
 		}
 	}
@@ -52,15 +52,19 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	if cfg != nil {
 		cfgProxyURL := strings.TrimSpace(cfg.ProxyURL)
 		if cfgProxyURL != "" {
-			httpClient.Transport = newUpstreamTTFBRoundTripper(ctx, newProxyPoolRoundTripper(ctx, cfgProxyURL, provider, roundTripperFromContext(ctx)))
+			httpClient.Transport = newConfiguredUpstreamRoundTripper(ctx, cfg, provider, newProxyPoolRoundTripper(ctx, cfgProxyURL, provider, roundTripperFromContext(ctx)))
 			return httpClient
 		}
 	}
 
 	// Priority 3: Use RoundTripper from context (typically from RoundTripperFor)
-	httpClient.Transport = newUpstreamTTFBRoundTripper(ctx, newInactiveProxyReuseRoundTripper(ctx, roundTripperFromContext(ctx), provider, proxyReuseReasonNoProxy))
+	httpClient.Transport = newConfiguredUpstreamRoundTripper(ctx, cfg, provider, newInactiveProxyReuseRoundTripper(ctx, roundTripperFromContext(ctx), provider, proxyReuseReasonNoProxy))
 
 	return httpClient
+}
+
+func newConfiguredUpstreamRoundTripper(ctx context.Context, cfg *config.Config, provider string, base http.RoundTripper) http.RoundTripper {
+	return newResponseHeaderRetryRoundTripper(newUpstreamTTFBRoundTripper(ctx, base), cfg, provider)
 }
 
 type upstreamTTFBRoundTripper struct {

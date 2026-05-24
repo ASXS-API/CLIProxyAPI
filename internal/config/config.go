@@ -90,6 +90,10 @@ type Config struct {
 	// Numeric values are seconds; duration strings like "300ms" are also accepted.
 	MaxRetryInterval RetryIntervalSeconds `yaml:"max-retry-interval" json:"max-retry-interval"`
 
+	// UpstreamResponseHeaderTimeout controls retries when an upstream accepts the
+	// request body but does not return response headers quickly enough.
+	UpstreamResponseHeaderTimeout UpstreamResponseHeaderTimeoutConfig `yaml:"upstream-response-header-timeout" json:"upstream-response-header-timeout"`
+
 	// QuotaExceeded defines the behavior when a quota is exceeded.
 	QuotaExceeded QuotaExceeded `yaml:"quota-exceeded" json:"quota-exceeded"`
 
@@ -701,6 +705,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if cfg.MaxRetryInterval < 0 {
 		cfg.MaxRetryInterval = 0
 	}
+	cfg.SanitizeUpstreamResponseHeaderTimeout()
 
 	// Sanitize Gemini API key configuration and migrate legacy entries.
 	cfg.SanitizeGeminiKeys()
