@@ -116,6 +116,9 @@ func (rt *responseHeaderRetryRoundTripper) RoundTrip(req *http.Request) (*http.R
 	if req == nil {
 		return base.RoundTrip(req)
 	}
+	if isResponsesCompactRequest(req) {
+		return base.RoundTrip(req)
+	}
 
 	timeouts := responseHeaderTimeoutAttempts(rt.initial, rt.maximum)
 	if len(timeouts) == 0 {
@@ -253,6 +256,14 @@ func requestBodyReplayable(req *http.Request) bool {
 		return true
 	}
 	return req.GetBody != nil
+}
+
+func isResponsesCompactRequest(req *http.Request) bool {
+	if req == nil || req.URL == nil {
+		return false
+	}
+	path := strings.TrimSpace(req.URL.EscapedPath())
+	return path == "/responses/compact" || strings.HasSuffix(path, "/responses/compact")
 }
 
 func requestForResponseHeaderAttempt(req *http.Request, attempt int) (*http.Request, error) {

@@ -170,3 +170,46 @@ func TestResponseHeaderTimeoutReturnsStatusErrorAfterRetries(t *testing.T) {
 		t.Fatalf("Attempts = %d, want 2", timeoutErr.Attempts)
 	}
 }
+
+func TestResponseHeaderTimeoutSkipsResponsesCompact(t *testing.T) {
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = io.Copy(io.Discard, r.Body)
+		time.Sleep(60 * time.Millisecond)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	t.Cleanup(server.Close)
+
+	cfg := &config.Config{
+		UpstreamResponseHeaderTimeout: config.UpstreamResponseHeaderTimeoutConfig{
+			Enabled: true,
+			Initial: config.RetryIntervalSeconds(0.01),
+			Max:     config.RetryIntervalSeconds(0.01),
+		},
+	}
+	client := &http.Client{
+		Transport: newResponseHeaderRetryRoundTripper(http.DefaultTransport, cfg, "test"),
+	}
+
+	req, errReq := http.NewRequestWithContext(context.Background(), http.MethodPost, server.URL+"/v1/responses/compact", bytes.NewReader([]byte("payload")))
+	if errReq != nil {
+		t.Fatalf("NewRequestWithContext() error = %v", errReq)
+	}
+
+	resp, errDo := client.Do(req)
+	if errDo != nil {
+		t.Fatalf("Do() error = %v", errDo)
+	}
+	defer resp.Body.Close()
+	body, errRead := io.ReadAll(resp.Body)
+	if errRead != nil {
+		t.Fatalf("ReadAll(response) error = %v", errRead)
+	}
+	if string(body) != "ok" {
+		t.Fatalf("response body = %q, want ok", body)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("calls = %d, want 1", got)
+	}
+}
