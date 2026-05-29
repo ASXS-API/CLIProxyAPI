@@ -5,11 +5,11 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
 
 func TestPrepareCodexResponsesRequestBodyFastMatchesFallback(t *testing.T) {
@@ -66,6 +66,65 @@ func TestPrepareCodexResponsesRequestBodyFastMatchesFallback(t *testing.T) {
 	assertJSONEqual(t, fallbackBody, fastBody)
 }
 
+func TestPrepareCodexResponsesRequestBodyFastReasoningMatchesFallback(t *testing.T) {
+	// A request carrying a "reasoning" object must now take the single-parse fast path
+	// (it previously fell back to the byte path). The fast-path output must stay
+	// equivalent to the full translate + ApplyThinking + ApplyPayloadConfig + finalize
+	// slow path.
+	rawJSON := []byte(`{
+		"model":"gpt-5.4-mini",
+		"instructions":null,
+		"input":[
+			{"type":"message","role":"system","content":[{"type":"input_text","text":"system"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hello <world>"}]}
+		],
+		"reasoning":{"effort":"high"},
+		"tools":[{"type":"web_search_preview"}],
+		"tool_choice":{"type":"web_search_preview_2025_03_11"},
+		"service_tier":"priority",
+		"max_output_tokens":1024,
+		"context_management":[{"type":"compaction"}],
+		"previous_response_id":"resp_old",
+		"stream_options":{"include_usage":true},
+		"user":"abc"
+	}`)
+	exec := NewCodexExecutor(&config.Config{})
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.4-mini",
+		Payload: rawJSON,
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FromString("openai-response"),
+		OriginalRequest: rawJSON,
+		Stream:          true,
+	}
+	from := opts.SourceFormat
+	to := sdktranslator.FromString("codex")
+	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	cacheID := "cache-1"
+
+	originalPayload, fastBody, ok, err := exec.prepareCodexResponsesRequestBodyFast(nil, req, opts, from, to, baseModel, codexStreamKeep, true, true, cacheID)
+	if err != nil {
+		t.Fatalf("prepareCodexResponsesRequestBodyFast error: %v", err)
+	}
+	if !ok {
+		t.Fatal("prepareCodexResponsesRequestBodyFast did not use fast path for reasoning request")
+	}
+	if !sameBytesBacking(originalPayload, rawJSON) {
+		t.Fatal("fast path did not preserve original payload backing")
+	}
+
+	originalTranslated, fallbackBody := translateCodexRequestPair(opts, from, to, baseModel, originalPayload, req.Payload, true)
+	fallbackBody, err = thinking.ApplyThinking(fallbackBody, req.Model, from.String(), to.String(), exec.Identifier())
+	if err != nil {
+		t.Fatalf("ApplyThinking error: %v", err)
+	}
+	fallbackBody = helps.ApplyPayloadConfigWithRoot(exec.cfg, baseModel, to.String(), "", fallbackBody, originalTranslated, req.Model, "")
+	fallbackBody = finalizeCodexRequestBody(fallbackBody, baseModel, codexStreamKeep, true, true, nil, cacheID)
+
+	assertJSONEqual(t, fallbackBody, fastBody)
+}
+
 func TestPrepareCodexResponsesRequestBodyFastFallsBackForByteMutators(t *testing.T) {
 	rawJSON := []byte(`{"model":"gpt-5.4-mini","input":"hello"}`)
 	req := cliproxyexecutor.Request{Model: "gpt-5.4-mini", Payload: rawJSON}
@@ -88,12 +147,6 @@ func TestPrepareCodexResponsesRequestBodyFastFallsBackForByteMutators(t *testing
 			exec: NewCodexExecutor(&config.Config{}),
 			req:  cliproxyexecutor.Request{Model: "gpt-5.4-mini(high)", Payload: rawJSON},
 			opts: opts,
-		},
-		{
-			name: "body reasoning",
-			exec: NewCodexExecutor(&config.Config{}),
-			req:  cliproxyexecutor.Request{Model: "gpt-5.4-mini", Payload: []byte(`{"model":"gpt-5.4-mini","input":"hello","reasoning":{"effort":"high"}}`)},
-			opts: cliproxyexecutor.Options{SourceFormat: from, Stream: true},
 		},
 		{
 			name: "payload rules",

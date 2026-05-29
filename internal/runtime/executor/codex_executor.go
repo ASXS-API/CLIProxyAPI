@@ -206,14 +206,31 @@ func (e *CodexExecutor) prepareCodexResponsesRequestBodyFast(auth *cliproxyauth.
 	if !parsed {
 		return originalPayload, nil, false, nil
 	}
-	if codexResponsesRequestObjectNeedsThinkingBytePath(obj) {
-		return originalPayload, nil, false, nil
-	}
+	// Previously, a request carrying a "reasoning" object bailed to the byte-based slow
+	// path solely so thinking.ApplyThinking could run. For reasoning models (gpt-5/codex)
+	// that is almost every request, and the fallback re-translated + re-finalized the whole
+	// body (several extra full JSON unmarshal/marshal passes — the dominant CPU cost under load).
+	//
+	// Instead, stay on the single-parse object path and apply thinking on the marshaled result.
+	// This is semantically equivalent here because:
+	//   - finalizeCodexRequestObject never touches "reasoning" and ApplyThinking only adjusts
+	//     "reasoning.effort", so they act on disjoint fields and their order does not matter;
+	//   - ApplyThinking takes the model from req.Model (not the body), so finalize setting
+	//     obj["model"] beforehand has no effect on it;
+	//   - the fast path is only eligible when no payload-config rules apply, so the slow path's
+	//     ApplyPayloadConfig step is a no-op and can be skipped.
+	needsThinking := codexResponsesRequestObjectNeedsThinkingBytePath(obj)
 
 	finalizeCodexRequestObject(obj, baseModel, streamPatch, removeUnsupported, addImageTool, auth, cacheID)
 	body, err = codexresponses.MarshalCodexRequestObject(obj)
 	if err != nil {
 		return originalPayload, nil, false, err
+	}
+	if needsThinking {
+		body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+		if err != nil {
+			return originalPayload, nil, false, err
+		}
 	}
 	return originalPayload, body, true, nil
 }
