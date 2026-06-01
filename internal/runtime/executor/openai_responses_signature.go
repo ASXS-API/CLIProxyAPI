@@ -27,8 +27,7 @@ func sanitizeOpenAIResponsesReasoningEncryptedContent(ctx context.Context, provi
 			continue
 		}
 
-		encryptedContentPath := fmt.Sprintf("input.%d.encrypted_content", index)
-		encryptedContent := gjson.GetBytes(updated, encryptedContentPath)
+		encryptedContent := item.Get("encrypted_content")
 		if !encryptedContent.Exists() {
 			continue
 		}
@@ -51,6 +50,7 @@ func sanitizeOpenAIResponsesReasoningEncryptedContent(ctx context.Context, provi
 			continue
 		}
 
+		encryptedContentPath := fmt.Sprintf("input.%d.encrypted_content", index)
 		next, err := sjson.DeleteBytes(updated, encryptedContentPath)
 		if err != nil {
 			helps.LogWithRequestID(ctx).Debugf("%s: failed to drop invalid reasoning encrypted_content at input[%d]: %v", provider, index, err)
@@ -58,7 +58,7 @@ func sanitizeOpenAIResponsesReasoningEncryptedContent(ctx context.Context, provi
 		}
 		updated = next
 
-		itemID := strings.TrimSpace(gjson.GetBytes(updated, fmt.Sprintf("input.%d.id", index)).String())
+		itemID := strings.TrimSpace(item.Get("id").String())
 		if itemID == "" {
 			itemID = fmt.Sprintf("input[%d]", index)
 		}
