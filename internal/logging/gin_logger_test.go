@@ -69,6 +69,12 @@ func TestIsAIAPIPathIncludesImages(t *testing.T) {
 	if !isAIAPIPath("/v1/images/edits") {
 		t.Fatalf("expected /v1/images/edits to be treated as AI API path")
 	}
+	if !isAIAPIPath("/v1/videos") {
+		t.Fatalf("expected /v1/videos to be treated as AI API path")
+	}
+	if !isAIAPIPath("/v1/videos/video_123") {
+		t.Fatalf("expected /v1/videos/video_123 to be treated as AI API path")
+	}
 }
 
 func TestGinLogrusLoggerIncludesUpstreamTTFB(t *testing.T) {
