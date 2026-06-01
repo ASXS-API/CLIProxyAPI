@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"context"
 	"encoding/json"
 	"reflect"
 	"testing"
@@ -44,7 +45,7 @@ func TestPrepareCodexResponsesRequestBodyFastMatchesFallback(t *testing.T) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 	cacheID := "cache-1"
 
-	originalPayload, fastBody, ok, err := exec.prepareCodexResponsesRequestBodyFast(nil, req, opts, from, to, baseModel, codexStreamKeep, true, true, cacheID)
+	originalPayload, fastBody, ok, err := exec.prepareCodexResponsesRequestBodyFast(context.Background(), nil,req, opts, from, to, baseModel, codexStreamKeep, true, true, cacheID)
 	if err != nil {
 		t.Fatalf("prepareCodexResponsesRequestBodyFast error: %v", err)
 	}
@@ -103,7 +104,7 @@ func TestPrepareCodexResponsesRequestBodyFastReasoningMatchesFallback(t *testing
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 	cacheID := "cache-1"
 
-	originalPayload, fastBody, ok, err := exec.prepareCodexResponsesRequestBodyFast(nil, req, opts, from, to, baseModel, codexStreamKeep, true, true, cacheID)
+	originalPayload, fastBody, ok, err := exec.prepareCodexResponsesRequestBodyFast(context.Background(), nil,req, opts, from, to, baseModel, codexStreamKeep, true, true, cacheID)
 	if err != nil {
 		t.Fatalf("prepareCodexResponsesRequestBodyFast error: %v", err)
 	}
@@ -180,7 +181,7 @@ func TestPrepareCodexResponsesRequestBodyFastFallsBackForByteMutators(t *testing
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			baseModel := thinking.ParseSuffix(tt.req.Model).ModelName
-			_, _, ok, err := tt.exec.prepareCodexResponsesRequestBodyFast(nil, tt.req, tt.opts, from, to, baseModel, codexStreamKeep, true, true, "cache-1")
+			_, _, ok, err := tt.exec.prepareCodexResponsesRequestBodyFast(context.Background(), nil,tt.req, tt.opts, from, to, baseModel, codexStreamKeep, true, true, "cache-1")
 			if err != nil {
 				t.Fatalf("prepareCodexResponsesRequestBodyFast error: %v", err)
 			}

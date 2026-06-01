@@ -193,7 +193,7 @@ func sameBytesBacking(a, b []byte) bool {
 	return &a[0] == &b[0]
 }
 
-func (e *CodexExecutor) prepareCodexResponsesRequestBodyFast(auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, from, to sdktranslator.Format, baseModel string, streamPatch codexStreamPatch, removeUnsupported bool, addImageTool bool, cacheID string) (originalPayload []byte, body []byte, ok bool, err error) {
+func (e *CodexExecutor) prepareCodexResponsesRequestBodyFast(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, from, to sdktranslator.Format, baseModel string, streamPatch codexStreamPatch, removeUnsupported bool, addImageTool bool, cacheID string) (originalPayload []byte, body []byte, ok bool, err error) {
 	originalPayload = req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayload = opts.OriginalRequest
@@ -222,6 +222,14 @@ func (e *CodexExecutor) prepareCodexResponsesRequestBodyFast(auth *cliproxyauth.
 	needsThinking := codexResponsesRequestObjectNeedsThinkingBytePath(obj)
 
 	finalizeCodexRequestObject(obj, baseModel, streamPatch, removeUnsupported, addImageTool, auth, cacheID)
+	// Drop invalid reasoning encrypted_content on the already-parsed input subtree,
+	// before marshaling — avoids re-scanning the whole serialized body afterwards.
+	// finalize/rewrite never touch encrypted_content, so obj["input"] still carries it.
+	if rawInput, exists := obj["input"]; exists {
+		if sanitizedInput, changed := sanitizeReasoningEncryptedContentInput(ctx, "codex executor", rawInput); changed {
+			obj["input"] = sanitizedInput
+		}
+	}
 	// All values in obj are known-valid JSON (req.Payload was json.Unmarshal'd and
 	// finalize sets valid literals), so emit them verbatim instead of re-compacting
 	// the large unchanged "input" array via json.Encoder.
@@ -439,7 +447,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	to := sdktranslator.FromString("codex")
 	addImageTool := e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff
 	cacheID := e.codexCacheID(ctx, from, req)
-	originalPayload, body, fastPath, prepErr := e.prepareCodexResponsesRequestBodyFast(auth, req, opts, from, to, baseModel, codexStreamTrue, true, addImageTool, cacheID)
+	originalPayload, body, fastPath, prepErr := e.prepareCodexResponsesRequestBodyFast(ctx, auth, req, opts, from, to, baseModel, codexStreamTrue, true, addImageTool, cacheID)
 	if prepErr != nil {
 		return resp, prepErr
 	}
@@ -461,8 +469,10 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		requestPath := helps.PayloadRequestPath(opts)
 		body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 		body = finalizeCodexRequestBody(body, baseModel, codexStreamTrue, true, addImageTool, auth, cacheID)
+		// Fast path already sanitized obj["input"] before marshaling; only the slow
+		// path needs the whole-body sanitize here.
+		body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
 	}
-	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
@@ -707,7 +717,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	to := sdktranslator.FromString("codex")
 	addImageTool := e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff
 	cacheID := e.codexCacheID(ctx, from, req)
-	originalPayload, body, fastPath, prepErr := e.prepareCodexResponsesRequestBodyFast(auth, req, opts, from, to, baseModel, codexStreamKeep, true, addImageTool, cacheID)
+	originalPayload, body, fastPath, prepErr := e.prepareCodexResponsesRequestBodyFast(ctx, auth, req, opts, from, to, baseModel, codexStreamKeep, true, addImageTool, cacheID)
 	if prepErr != nil {
 		return nil, prepErr
 	}
@@ -729,8 +739,10 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		requestPath := helps.PayloadRequestPath(opts)
 		body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 		body = finalizeCodexRequestBody(body, baseModel, codexStreamKeep, true, addImageTool, auth, cacheID)
+		// Fast path already sanitized obj["input"] before marshaling; only the slow
+		// path needs the whole-body sanitize here.
+		body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
 	}
-	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
