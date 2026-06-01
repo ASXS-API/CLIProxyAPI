@@ -86,6 +86,19 @@ func IsUserDefinedModel(modelInfo *registry.ModelInfo) bool {
 //	// Without suffix - uses body config
 //	result, err := thinking.ApplyThinking(body, "gemini-2.5-pro", "gemini", "gemini", "gemini")
 func ApplyThinking(body []byte, model string, fromFormat string, toFormat string, providerKey string) ([]byte, error) {
+	return applyThinking(body, model, fromFormat, toFormat, providerKey, false)
+}
+
+// ApplyThinkingTrusted behaves exactly like ApplyThinking but skips redundant
+// whole-body JSON validation. Callers MUST guarantee that body is already valid
+// JSON (e.g. a body the executor just marshaled). For any valid body the result
+// is byte-identical to ApplyThinking; the only difference is the elimination of
+// two O(n) gjson.ValidBytes scans of the (potentially large) request body.
+func ApplyThinkingTrusted(body []byte, model string, fromFormat string, toFormat string, providerKey string) ([]byte, error) {
+	return applyThinking(body, model, fromFormat, toFormat, providerKey, true)
+}
+
+func applyThinking(body []byte, model string, fromFormat string, toFormat string, providerKey string, trusted bool) ([]byte, error) {
 	providerFormat := strings.ToLower(strings.TrimSpace(toFormat))
 	providerKey = strings.ToLower(strings.TrimSpace(providerKey))
 	if providerKey == "" {
@@ -115,10 +128,10 @@ func ApplyThinking(body []byte, model string, fromFormat string, toFormat string
 	// Unknown models are treated as user-defined so thinking config can still be applied.
 	// The upstream service is responsible for validating the configuration.
 	if IsUserDefinedModel(modelInfo) {
-		return applyUserDefinedModel(body, modelInfo, fromFormat, providerFormat, suffixResult)
+		return applyUserDefinedModel(body, modelInfo, fromFormat, providerFormat, suffixResult, trusted)
 	}
 	if modelInfo.Thinking == nil {
-		config := extractThinkingConfig(body, providerFormat)
+		config := extractThinkingConfigMaybe(body, providerFormat, trusted)
 		if hasThinkingConfig(config) {
 			log.WithFields(log.Fields{
 				"model":    baseModel,
@@ -145,7 +158,7 @@ func ApplyThinking(body []byte, model string, fromFormat string, toFormat string
 			"level":    config.Level,
 		}).Debug("thinking: config from model suffix |")
 	} else {
-		config = extractThinkingConfig(body, providerFormat)
+		config = extractThinkingConfigMaybe(body, providerFormat, trusted)
 		if hasThinkingConfig(config) {
 			log.WithFields(log.Fields{
 				"provider": providerFormat,
@@ -197,7 +210,20 @@ func ApplyThinking(body []byte, model string, fromFormat string, toFormat string
 	}).Debug("thinking: processed config to apply |")
 
 	// 6. Apply configuration using provider-specific applier
-	return applier.Apply(body, *validated, modelInfo)
+	return applyMaybeTrusted(applier, body, *validated, modelInfo, trusted)
+}
+
+// applyMaybeTrusted dispatches to a provider's trusted fast path when the caller
+// vouches for body validity and the applier implements TrustedProviderApplier;
+// otherwise it falls back to the standard (validating) Apply. Behavior is
+// identical for any valid body.
+func applyMaybeTrusted(applier ProviderApplier, body []byte, config ThinkingConfig, modelInfo *registry.ModelInfo, trusted bool) ([]byte, error) {
+	if trusted {
+		if ta, ok := applier.(TrustedProviderApplier); ok {
+			return ta.ApplyTrusted(body, config, modelInfo)
+		}
+	}
+	return applier.Apply(body, config, modelInfo)
 }
 
 // parseSuffixToConfig converts a raw suffix string to ThinkingConfig.
@@ -243,7 +269,7 @@ func parseSuffixToConfig(rawSuffix, provider, model string) ThinkingConfig {
 
 // applyUserDefinedModel applies thinking configuration for user-defined models
 // without ThinkingSupport validation.
-func applyUserDefinedModel(body []byte, modelInfo *registry.ModelInfo, fromFormat, toFormat string, suffixResult SuffixResult) ([]byte, error) {
+func applyUserDefinedModel(body []byte, modelInfo *registry.ModelInfo, fromFormat, toFormat string, suffixResult SuffixResult, trusted bool) ([]byte, error) {
 	// Get model ID for logging
 	modelID := ""
 	if modelInfo != nil {
@@ -257,9 +283,9 @@ func applyUserDefinedModel(body []byte, modelInfo *registry.ModelInfo, fromForma
 	if suffixResult.HasSuffix {
 		config = parseSuffixToConfig(suffixResult.RawSuffix, toFormat, modelID)
 	} else {
-		config = extractThinkingConfig(body, fromFormat)
+		config = extractThinkingConfigMaybe(body, fromFormat, trusted)
 		if !hasThinkingConfig(config) && fromFormat != toFormat {
-			config = extractThinkingConfig(body, toFormat)
+			config = extractThinkingConfigMaybe(body, toFormat, trusted)
 		}
 	}
 
@@ -289,7 +315,7 @@ func applyUserDefinedModel(body []byte, modelInfo *registry.ModelInfo, fromForma
 	}).Debug("thinking: applying config for user-defined model (skip validation)")
 
 	config = normalizeUserDefinedConfig(config, fromFormat, toFormat)
-	return applier.Apply(body, config, modelInfo)
+	return applyMaybeTrusted(applier, body, config, modelInfo, trusted)
 }
 
 func normalizeUserDefinedConfig(config ThinkingConfig, fromFormat, toFormat string) ThinkingConfig {
@@ -317,7 +343,25 @@ func extractThinkingConfig(body []byte, provider string) ThinkingConfig {
 	if len(body) == 0 || !gjson.ValidBytes(body) {
 		return ThinkingConfig{}
 	}
+	return extractThinkingConfigUnchecked(body, provider)
+}
 
+// extractThinkingConfigMaybe is extractThinkingConfig with an optional fast path:
+// when trusted is true the caller guarantees body is valid JSON, so the O(n)
+// gjson.ValidBytes scan is skipped. For any valid body the result is identical.
+func extractThinkingConfigMaybe(body []byte, provider string, trusted bool) ThinkingConfig {
+	if len(body) == 0 {
+		return ThinkingConfig{}
+	}
+	if !trusted && !gjson.ValidBytes(body) {
+		return ThinkingConfig{}
+	}
+	return extractThinkingConfigUnchecked(body, provider)
+}
+
+// extractThinkingConfigUnchecked dispatches config extraction by provider without
+// validating body. Callers must ensure body is non-empty valid JSON.
+func extractThinkingConfigUnchecked(body []byte, provider string) ThinkingConfig {
 	switch provider {
 	case "claude":
 		return extractClaudeConfig(body)

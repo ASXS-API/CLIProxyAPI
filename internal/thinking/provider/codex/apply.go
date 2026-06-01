@@ -22,6 +22,7 @@ import (
 type Applier struct{}
 
 var _ thinking.ProviderApplier = (*Applier)(nil)
+var _ thinking.TrustedProviderApplier = (*Applier)(nil)
 
 // NewApplier creates a new Codex thinking applier.
 func NewApplier() *Applier {
@@ -42,8 +43,19 @@ func init() {
 //	  }
 //	}
 func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *registry.ModelInfo) ([]byte, error) {
+	return a.apply(body, config, modelInfo, false)
+}
+
+// ApplyTrusted implements thinking.TrustedProviderApplier. It is identical to
+// Apply for any valid body but skips the whole-body gjson.ValidBytes guard,
+// since the caller guarantees body is already valid JSON.
+func (a *Applier) ApplyTrusted(body []byte, config thinking.ThinkingConfig, modelInfo *registry.ModelInfo) ([]byte, error) {
+	return a.apply(body, config, modelInfo, true)
+}
+
+func (a *Applier) apply(body []byte, config thinking.ThinkingConfig, modelInfo *registry.ModelInfo, trusted bool) ([]byte, error) {
 	if thinking.IsUserDefinedModel(modelInfo) {
-		return applyCompatibleCodex(body, config)
+		return applyCompatibleCodex(body, config, trusted)
 	}
 	if modelInfo.Thinking == nil {
 		return body, nil
@@ -54,7 +66,7 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 		return body, nil
 	}
 
-	if len(body) == 0 || !gjson.ValidBytes(body) {
+	if len(body) == 0 || (!trusted && !gjson.ValidBytes(body)) {
 		body = []byte(`{}`)
 	}
 
@@ -84,8 +96,8 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 	return result, nil
 }
 
-func applyCompatibleCodex(body []byte, config thinking.ThinkingConfig) ([]byte, error) {
-	if len(body) == 0 || !gjson.ValidBytes(body) {
+func applyCompatibleCodex(body []byte, config thinking.ThinkingConfig, trusted bool) ([]byte, error) {
+	if len(body) == 0 || (!trusted && !gjson.ValidBytes(body)) {
 		body = []byte(`{}`)
 	}
 

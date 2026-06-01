@@ -117,3 +117,13 @@ type ProviderApplier interface {
 	//   - ThinkingError if the configuration is invalid or unsupported
 	Apply(body []byte, config ThinkingConfig, modelInfo *registry.ModelInfo) ([]byte, error)
 }
+
+// TrustedProviderApplier is an optional interface a ProviderApplier may implement
+// to offer a fast path for callers that guarantee body is already valid JSON
+// (e.g. a body the executor just marshaled). Implementations MUST behave
+// identically to Apply for any valid body; they only skip redundant whole-body
+// JSON validation. The unified entry point ApplyThinkingTrusted prefers this
+// method when available and falls back to Apply otherwise.
+type TrustedProviderApplier interface {
+	ApplyTrusted(body []byte, config ThinkingConfig, modelInfo *registry.ModelInfo) ([]byte, error)
+}

@@ -227,7 +227,10 @@ func (e *CodexExecutor) prepareCodexResponsesRequestBodyFast(auth *cliproxyauth.
 		return originalPayload, nil, false, err
 	}
 	if needsThinking {
-		body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+		// body was just produced by MarshalCodexRequestObject, so it is guaranteed
+		// valid JSON; ApplyThinkingTrusted skips the redundant whole-body
+		// gjson.ValidBytes re-validation (hot path under long-context load).
+		body, err = thinking.ApplyThinkingTrusted(body, req.Model, from.String(), to.String(), e.Identifier())
 		if err != nil {
 			return originalPayload, nil, false, err
 		}
