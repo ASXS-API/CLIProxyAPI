@@ -83,6 +83,18 @@ func (r *UsageReporter) SetTranslatedReasoningEffort(payload []byte, format stri
 	r.serviceTier = extractServiceTierFromPayload(payload)
 }
 
+// SetTranslatedReasoningEffortTrusted is SetTranslatedReasoningEffort for callers
+// that guarantee payload is already valid JSON (e.g. a body the executor just
+// built). It skips the whole-body gjson.ValidBytes scan; the reported values are
+// identical to SetTranslatedReasoningEffort for any valid payload.
+func (r *UsageReporter) SetTranslatedReasoningEffortTrusted(payload []byte, format string) {
+	if r == nil {
+		return
+	}
+	r.reasoning = thinking.ExtractTranslatedReasoningEffortTrusted(payload, format)
+	r.serviceTier = extractServiceTierFromPayload(payload)
+}
+
 func (r *UsageReporter) TrackHTTPClient(client *http.Client) *http.Client {
 	if r == nil || client == nil {
 		return client

@@ -473,7 +473,13 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		// path needs the whole-body sanitize here.
 		body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
 	}
-	reporter.SetTranslatedReasoningEffort(body, to.String())
+	if fastPath {
+		// body was just built by the fast path and is valid JSON; skip the redundant
+		// whole-body gjson.ValidBytes scan when deriving the reported reasoning effort.
+		reporter.SetTranslatedReasoningEffortTrusted(body, to.String())
+	} else {
+		reporter.SetTranslatedReasoningEffort(body, to.String())
+	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	var identityState codexIdentityConfuseState
@@ -743,7 +749,13 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		// path needs the whole-body sanitize here.
 		body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
 	}
-	reporter.SetTranslatedReasoningEffort(body, to.String())
+	if fastPath {
+		// body was just built by the fast path and is valid JSON; skip the redundant
+		// whole-body gjson.ValidBytes scan when deriving the reported reasoning effort.
+		reporter.SetTranslatedReasoningEffortTrusted(body, to.String())
+	} else {
+		reporter.SetTranslatedReasoningEffort(body, to.String())
+	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	var identityState codexIdentityConfuseState

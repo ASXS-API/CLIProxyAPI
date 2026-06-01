@@ -407,8 +407,21 @@ func ExtractReasoningEffort(body []byte, provider, model string) string {
 // ExtractTranslatedReasoningEffort returns the final provider payload's thinking
 // setting as a canonical reasoning_effort label for usage logging.
 func ExtractTranslatedReasoningEffort(body []byte, provider string) string {
+	return extractTranslatedReasoningEffort(body, provider, false)
+}
+
+// ExtractTranslatedReasoningEffortTrusted behaves exactly like
+// ExtractTranslatedReasoningEffort but skips the whole-body gjson.ValidBytes scan.
+// Callers must pass a body that is already valid JSON (e.g. one the executor just
+// built). For valid bodies the result is identical; for invalid bodies both return
+// "" (gjson reads of a malformed body yield no config either way).
+func ExtractTranslatedReasoningEffortTrusted(body []byte, provider string) string {
+	return extractTranslatedReasoningEffort(body, provider, true)
+}
+
+func extractTranslatedReasoningEffort(body []byte, provider string, trusted bool) string {
 	provider = strings.ToLower(strings.TrimSpace(provider))
-	config := extractThinkingConfig(body, provider)
+	config := extractThinkingConfigMaybe(body, provider, trusted)
 	if !hasThinkingConfig(config) {
 		switch provider {
 		case "openai", "openai-response":
