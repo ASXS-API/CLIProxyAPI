@@ -4,8 +4,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
+	"strings"
+	"unsafe"
 
+	gojson "github.com/goccy/go-json"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -13,6 +17,83 @@ import (
 
 // CodexRequestObject is the top-level Responses request object after Codex compatibility rewrites.
 type CodexRequestObject = map[string]json.RawMessage
+
+// codexTopLevelDecoder splits a Responses request body into its top-level
+// key -> raw value map (values kept as opaque json.RawMessage). Implementations
+// must be equivalent for valid JSON; they differ only in speed and in how strictly
+// they reject malformed input.
+type codexTopLevelDecoder func([]byte) (CodexRequestObject, bool)
+
+// codexDecoder selects the inbound top-level decoder. Default is the gjson
+// zero-copy split (fastest). Override at startup via env:
+//
+//	CODEX_DECODER=go-json  -> goccy/go-json, validating, ~2-3x (safe fallback)
+//	CODEX_DECODER=stdlib   -> encoding/json, exact legacy behavior
+var codexDecoder = decodeTopLevelGjson
+
+func init() {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_DECODER"))) {
+	case "go-json", "gojson":
+		codexDecoder = decodeTopLevelGoJSON
+	case "stdlib", "encoding/json", "json":
+		codexDecoder = decodeTopLevelStdlib
+	}
+}
+
+// decodeTopLevelStdlib uses encoding/json (full validation). Retained as the
+// behavioral baseline / differential reference and as an opt-in fallback.
+func decodeTopLevelStdlib(inputRawJSON []byte) (CodexRequestObject, bool) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(inputRawJSON, &obj); err != nil || obj == nil {
+		return nil, false
+	}
+	return obj, true
+}
+
+// decodeTopLevelGoJSON uses goccy/go-json: identical full-validation +
+// json.RawMessage semantics to encoding/json (so the malformed-input contract is
+// preserved exactly), but ~2-3x faster. Pure Go, uniform across amd64/arm64.
+func decodeTopLevelGoJSON(inputRawJSON []byte) (CodexRequestObject, bool) {
+	var obj map[string]json.RawMessage
+	if err := gojson.Unmarshal(inputRawJSON, &obj); err != nil || obj == nil {
+		return nil, false
+	}
+	return obj, true
+}
+
+// decodeTopLevelGjson splits ONLY the top level with gjson, storing each value as
+// a json.RawMessage that ALIASES gjson's parse buffer (no per-value copy). It does
+// NOT deeply validate nested JSON, so a malformed body is accepted here and — as
+// today — rejected by the Codex upstream (the legacy slow path is equally lenient
+// and also forwards). For valid JSON the resulting map is equivalent to
+// encoding/json, verified by differential tests.
+//
+// ALIASING INVARIANT: the returned RawMessage values must be treated as read-only.
+// Downstream code (finalizeCodexRequestObject, MarshalCodexRequestObjectFast)
+// REPLACES map entries rather than mutating value bytes in place, which keeps the
+// aliasing safe; a regression test asserts the source body is not mutated.
+func decodeTopLevelGjson(inputRawJSON []byte) (CodexRequestObject, bool) {
+	root := gjson.ParseBytes(inputRawJSON)
+	if !root.IsObject() {
+		return nil, false
+	}
+	obj := make(CodexRequestObject, 16)
+	root.ForEach(func(key, value gjson.Result) bool {
+		obj[key.String()] = json.RawMessage(unsafeStringToBytes(value.Raw))
+		return true
+	})
+	// An empty object yields an empty (non-nil) map, matching json.Unmarshal("{}").
+	return obj, true
+}
+
+// unsafeStringToBytes returns a []byte aliasing s without copying. The result MUST
+// NOT be mutated. Used only for read-only RawMessage values produced by gjson.
+func unsafeStringToBytes(s string) []byte {
+	if len(s) == 0 {
+		return nil
+	}
+	return unsafe.Slice(unsafe.StringData(s), len(s))
+}
 
 func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte, _ bool) []byte {
 	if rawJSON, ok := rewriteOpenAIResponsesRequestForCodex(inputRawJSON); ok {
@@ -74,8 +155,8 @@ func rewriteOpenAIResponsesRequestForCodex(inputRawJSON []byte) ([]byte, bool) {
 
 // RewriteOpenAIResponsesRequestObjectForCodex parses and rewrites an OpenAI Responses request for Codex without marshaling it.
 func RewriteOpenAIResponsesRequestObjectForCodex(inputRawJSON []byte) (CodexRequestObject, bool) {
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(inputRawJSON, &obj); err != nil || obj == nil {
+	obj, ok := codexDecoder(inputRawJSON)
+	if !ok {
 		return nil, false
 	}
 	RewriteOpenAIResponsesRequestObjectFieldsForCodex(obj)
