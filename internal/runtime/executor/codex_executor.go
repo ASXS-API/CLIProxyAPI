@@ -222,7 +222,10 @@ func (e *CodexExecutor) prepareCodexResponsesRequestBodyFast(auth *cliproxyauth.
 	needsThinking := codexResponsesRequestObjectNeedsThinkingBytePath(obj)
 
 	finalizeCodexRequestObject(obj, baseModel, streamPatch, removeUnsupported, addImageTool, auth, cacheID)
-	body, err = codexresponses.MarshalCodexRequestObject(obj)
+	// All values in obj are known-valid JSON (req.Payload was json.Unmarshal'd and
+	// finalize sets valid literals), so emit them verbatim instead of re-compacting
+	// the large unchanged "input" array via json.Encoder.
+	body, err = codexresponses.MarshalCodexRequestObjectFast(obj)
 	if err != nil {
 		return originalPayload, nil, false, err
 	}

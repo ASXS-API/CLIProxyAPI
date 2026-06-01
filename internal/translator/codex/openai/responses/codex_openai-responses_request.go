@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"sort"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -124,6 +125,59 @@ func RewriteOpenAIResponsesRequestObjectFieldsForCodex(obj CodexRequestObject) {
 // MarshalCodexRequestObject marshals a rewritten Codex request object without HTML escaping.
 func MarshalCodexRequestObject(obj CodexRequestObject) ([]byte, error) {
 	return marshalJSONNoEscape(obj)
+}
+
+// MarshalCodexRequestObjectFast serializes a Codex request object WITHOUT
+// re-compacting each value. Every value in obj is already a valid JSON
+// RawMessage — either copied verbatim from the source payload (which was parsed
+// with json.Unmarshal, so it is valid) or freshly produced by the rewrite /
+// finalize step — so values are emitted as-is. This avoids the O(n) re-compaction
+// of the large unchanged "input" array that MarshalCodexRequestObject performs via
+// json.Encoder on every request.
+//
+// Keys are emitted in sorted order (matching encoding/json's map key ordering) and
+// encoded without HTML escaping, so the result is JSON-equivalent to
+// MarshalCodexRequestObject. It is not necessarily BYTE-identical: untouched values
+// keep their original insignificant whitespace instead of being minified. Callers
+// MUST only use this when obj's values are known-valid JSON (the Codex fast path
+// guarantees this).
+func MarshalCodexRequestObjectFast(obj CodexRequestObject) ([]byte, error) {
+	if len(obj) == 0 {
+		return []byte(`{}`), nil
+	}
+
+	keys := make([]string, 0, len(obj))
+	estimate := 2 // surrounding braces
+	for k, v := range obj {
+		keys = append(keys, k)
+		estimate += len(k) + len(v) + 4 // quotes, colon, comma
+	}
+	sort.Strings(keys)
+
+	var buf bytes.Buffer
+	buf.Grow(estimate)
+	buf.WriteByte('{')
+	for i, k := range keys {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		keyJSON, err := marshalJSONNoEscape(k)
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(keyJSON)
+		buf.WriteByte(':')
+		// Values are already valid JSON; copy them verbatim (no re-compaction).
+		// TrimSpace keeps the output tidy and matches RawMessage value semantics;
+		// an empty/nil value marshals to null, as encoding/json would.
+		v := bytes.TrimSpace(obj[k])
+		if len(v) == 0 {
+			v = []byte("null")
+		}
+		buf.Write(v)
+	}
+	buf.WriteByte('}')
+	return buf.Bytes(), nil
 }
 
 func rewriteResponsesInput(rawInput json.RawMessage) json.RawMessage {
