@@ -879,7 +879,7 @@ func validateSSEDataJSON(chunk []byte) error {
 		if bytes.Equal(data, []byte("[DONE]")) {
 			continue
 		}
-		if json.Valid(data) {
+		if gjson.ValidBytes(data) {
 			continue
 		}
 		const max = 512

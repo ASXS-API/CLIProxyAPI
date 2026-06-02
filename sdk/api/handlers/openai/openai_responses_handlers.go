@@ -9,7 +9,6 @@ package openai
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -102,7 +101,7 @@ func (f *responsesSSEFramer) writeFrame(w io.Writer, frame []byte) {
 
 func (f *responsesSSEFramer) repairFrame(frame []byte) []byte {
 	payload, ok := responsesSSEDataPayload(frame)
-	if !ok || len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) || !json.Valid(payload) {
+	if !ok || len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) || !gjson.ValidBytes(payload) {
 		return frame
 	}
 
@@ -292,7 +291,7 @@ func responsesSSEDataLinesValid(chunk []byte) bool {
 		if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
 			continue
 		}
-		if !json.Valid(data) {
+		if !gjson.ValidBytes(data) {
 			return false
 		}
 	}
