@@ -64,7 +64,7 @@ func sanitizeReasoningEncryptedContentInput(ctx context.Context, provider string
 			rawSignature := encryptedContent.String()
 			if rawSignature != strings.TrimSpace(rawSignature) {
 				reason = "encrypted_content has leading or trailing whitespace"
-			} else if _, err := signature.InspectGPTReasoningSignature(rawSignature); err != nil {
+			} else if err := signature.InspectGPTReasoningSignatureCached(rawSignature); err != nil {
 				reason = err.Error()
 			}
 		case gjson.Null:
