@@ -202,7 +202,7 @@ func (e *CodexExecutor) prepareCodexResponsesRequestBodyFast(ctx context.Context
 		return originalPayload, nil, false, nil
 	}
 
-	obj, parsed := codexresponses.RewriteOpenAIResponsesRequestObjectForCodex(req.Payload)
+	obj, parsed := codexresponses.RewriteOpenAIResponsesRequestObjectForCodexFast(req.Payload)
 	if !parsed {
 		return originalPayload, nil, false, nil
 	}
@@ -222,12 +222,13 @@ func (e *CodexExecutor) prepareCodexResponsesRequestBodyFast(ctx context.Context
 	needsThinking := codexResponsesRequestObjectNeedsThinkingBytePath(obj)
 
 	finalizeCodexRequestObject(obj, baseModel, streamPatch, removeUnsupported, addImageTool, auth, cacheID)
-	// Drop invalid reasoning encrypted_content on the already-parsed input subtree,
-	// before marshaling — avoids re-scanning the whole serialized body afterwards.
-	// finalize/rewrite never touch encrypted_content, so obj["input"] still carries it.
+	// Single combined walk over the parsed input array: system->developer role rewrite
+	// (deferred from RewriteObjectForCodexFast) + invalid reasoning encrypted_content
+	// drop, before marshaling. Folds two input walks into one and avoids re-scanning
+	// the whole serialized body. finalize never touches input.
 	if rawInput, exists := obj["input"]; exists {
-		if sanitizedInput, changed := sanitizeReasoningEncryptedContentInput(ctx, "codex executor", rawInput); changed {
-			obj["input"] = sanitizedInput
+		if rewrittenInput, changed := sanitizeAndRewriteCodexInput(ctx, "codex executor", rawInput); changed {
+			obj["input"] = rewrittenInput
 		}
 	}
 	// All values in obj are known-valid JSON (req.Payload was json.Unmarshal'd and

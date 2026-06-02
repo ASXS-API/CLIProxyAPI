@@ -163,14 +163,46 @@ func RewriteOpenAIResponsesRequestObjectForCodex(inputRawJSON []byte) (CodexRequ
 	return obj, true
 }
 
+// RewriteOpenAIResponsesRequestObjectForCodexFast is like
+// RewriteOpenAIResponsesRequestObjectForCodex but DEFERS the input-array
+// system->developer rewrite to the caller. The Codex executor fast path folds that
+// rewrite into its single combined sanitize+rewrite walk over obj["input"], so doing
+// it here too would scan the input array twice. String input is still normalized.
+func RewriteOpenAIResponsesRequestObjectForCodexFast(inputRawJSON []byte) (CodexRequestObject, bool) {
+	obj, ok := codexDecoder(inputRawJSON)
+	if !ok {
+		return nil, false
+	}
+	rewriteOpenAIResponsesRequestObjectFieldsForCodex(obj, false)
+	return obj, true
+}
+
+// RewriteCodexInputItemSystemRole converts a single Responses input item's role from
+// "system" to "developer" (Codex compatibility). It returns the item unchanged with
+// changed=false when the item's role is not "system". Exported so the executor can
+// apply the same per-item rewrite inside its combined input walk.
+func RewriteCodexInputItemSystemRole(itemRaw []byte) ([]byte, bool) {
+	if gjson.GetBytes(itemRaw, "role").String() != "system" {
+		return itemRaw, false
+	}
+	return rewriteJSONObjectStringField(itemRaw, "role", "developer")
+}
+
 // RewriteOpenAIResponsesRequestObjectFieldsForCodex applies Codex compatibility rewrites to a parsed request object.
 func RewriteOpenAIResponsesRequestObjectFieldsForCodex(obj CodexRequestObject) {
+	rewriteOpenAIResponsesRequestObjectFieldsForCodex(obj, true)
+}
+
+// rewriteOpenAIResponsesRequestObjectFieldsForCodex applies the Codex compatibility
+// rewrites. When rewriteInputArraySystemRoles is false the input-array
+// system->developer rewrite is skipped (string input is still normalized).
+func rewriteOpenAIResponsesRequestObjectFieldsForCodex(obj CodexRequestObject, rewriteInputArraySystemRoles bool) {
 	if obj == nil {
 		return
 	}
 
 	if rawInput, exists := obj["input"]; exists {
-		obj["input"] = rewriteResponsesInput(rawInput)
+		obj["input"] = rewriteResponsesInput(rawInput, rewriteInputArraySystemRoles)
 	}
 
 	obj["stream"] = json.RawMessage(`true`)
@@ -261,7 +293,7 @@ func MarshalCodexRequestObjectFast(obj CodexRequestObject) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func rewriteResponsesInput(rawInput json.RawMessage) json.RawMessage {
+func rewriteResponsesInput(rawInput json.RawMessage, rewriteArraySystemRoles bool) json.RawMessage {
 	switch firstNonSpaceJSONByte(rawInput) {
 	case '"':
 		inputText, ok := decodeJSONString(rawInput)
@@ -292,8 +324,10 @@ func rewriteResponsesInput(rawInput json.RawMessage) json.RawMessage {
 		}
 		return rawInput
 	case '[':
-		if rewrittenInput, changed := rewriteSystemRolesInInputArray(rawInput); changed {
-			return rewrittenInput
+		if rewriteArraySystemRoles {
+			if rewrittenInput, changed := rewriteSystemRolesInInputArray(rawInput); changed {
+				return rewrittenInput
+			}
 		}
 	}
 	return rawInput
@@ -340,10 +374,8 @@ func rewriteSystemRolesInInputArray(rawInput []byte) ([]byte, bool) {
 		first = false
 
 		itemRaw := []byte(item.Raw)
-		if item.Get("role").String() == "system" {
-			if updated, ok := rewriteJSONObjectStringField(itemRaw, "role", "developer"); ok {
-				itemRaw = updated
-			}
+		if rewritten, ok := RewriteCodexInputItemSystemRole(itemRaw); ok {
+			itemRaw = rewritten
 		}
 		out.Write(itemRaw)
 		return true

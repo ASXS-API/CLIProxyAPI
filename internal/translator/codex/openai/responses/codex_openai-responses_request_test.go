@@ -488,7 +488,7 @@ func TestConvertOpenAIResponsesRequestToCodex_NormalizesEscapedWebSearchAlias(t 
 
 func TestRewriteResponsesInputDispatchesAfterWhitespace(t *testing.T) {
 	t.Run("string input", func(t *testing.T) {
-		output := rewriteResponsesInput(json.RawMessage(" \n\t\"hello <world>\""))
+		output := rewriteResponsesInput(json.RawMessage(" \n\t\"hello <world>\""), true)
 		if got := gjson.GetBytes(output, "0.role").String(); got != "user" {
 			t.Fatalf("role = %q, want user: %s", got, string(output))
 		}
@@ -499,7 +499,7 @@ func TestRewriteResponsesInputDispatchesAfterWhitespace(t *testing.T) {
 
 	t.Run("array input", func(t *testing.T) {
 		output := rewriteResponsesInput(json.RawMessage(` 
-			[{"type":"message","role":"system","content":"hello"}]`))
+			[{"type":"message","role":"system","content":"hello"}]`), true)
 		if got := gjson.GetBytes(output, "0.role").String(); got != "developer" {
 			t.Fatalf("role = %q, want developer: %s", got, string(output))
 		}
@@ -508,7 +508,7 @@ func TestRewriteResponsesInputDispatchesAfterWhitespace(t *testing.T) {
 	t.Run("other input", func(t *testing.T) {
 		input := json.RawMessage(` 
 			{"type":"message","role":"system","content":"hello"}`)
-		output := rewriteResponsesInput(input)
+		output := rewriteResponsesInput(input, true)
 		if !bytes.Equal(output, input) {
 			t.Fatalf("object input should be unchanged\nwant: %s\n got: %s", string(input), string(output))
 		}
