@@ -43,9 +43,7 @@ func TestPrepareCodexResponsesRequestBodyFastMatchesFallback(t *testing.T) {
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
-	cacheID := "cache-1"
-
-	originalPayload, fastBody, ok, err := exec.prepareCodexResponsesRequestBodyFast(context.Background(), nil,req, opts, from, to, baseModel, codexStreamKeep, true, true, cacheID)
+	originalPayload, fastBody, ok, err := exec.prepareCodexResponsesRequestBodyFast(context.Background(), nil,req, opts, from, to, baseModel, codexStreamKeep, true, true)
 	if err != nil {
 		t.Fatalf("prepareCodexResponsesRequestBodyFast error: %v", err)
 	}
@@ -62,7 +60,7 @@ func TestPrepareCodexResponsesRequestBodyFastMatchesFallback(t *testing.T) {
 		t.Fatalf("ApplyThinking error: %v", err)
 	}
 	fallbackBody = helps.ApplyPayloadConfigWithRoot(exec.cfg, baseModel, to.String(), "", fallbackBody, originalTranslated, req.Model, "")
-	fallbackBody = finalizeCodexRequestBody(fallbackBody, baseModel, codexStreamKeep, true, true, nil, cacheID)
+	fallbackBody = finalizeCodexRequestBody(fallbackBody, baseModel, codexStreamKeep, true, true, nil, "")
 
 	assertJSONEqual(t, fallbackBody, fastBody)
 }
@@ -102,9 +100,7 @@ func TestPrepareCodexResponsesRequestBodyFastReasoningMatchesFallback(t *testing
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
-	cacheID := "cache-1"
-
-	originalPayload, fastBody, ok, err := exec.prepareCodexResponsesRequestBodyFast(context.Background(), nil,req, opts, from, to, baseModel, codexStreamKeep, true, true, cacheID)
+	originalPayload, fastBody, ok, err := exec.prepareCodexResponsesRequestBodyFast(context.Background(), nil,req, opts, from, to, baseModel, codexStreamKeep, true, true)
 	if err != nil {
 		t.Fatalf("prepareCodexResponsesRequestBodyFast error: %v", err)
 	}
@@ -121,7 +117,7 @@ func TestPrepareCodexResponsesRequestBodyFastReasoningMatchesFallback(t *testing
 		t.Fatalf("ApplyThinking error: %v", err)
 	}
 	fallbackBody = helps.ApplyPayloadConfigWithRoot(exec.cfg, baseModel, to.String(), "", fallbackBody, originalTranslated, req.Model, "")
-	fallbackBody = finalizeCodexRequestBody(fallbackBody, baseModel, codexStreamKeep, true, true, nil, cacheID)
+	fallbackBody = finalizeCodexRequestBody(fallbackBody, baseModel, codexStreamKeep, true, true, nil, "")
 
 	assertJSONEqual(t, fallbackBody, fastBody)
 }
@@ -181,7 +177,7 @@ func TestPrepareCodexResponsesRequestBodyFastFallsBackForByteMutators(t *testing
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			baseModel := thinking.ParseSuffix(tt.req.Model).ModelName
-			_, _, ok, err := tt.exec.prepareCodexResponsesRequestBodyFast(context.Background(), nil,tt.req, tt.opts, from, to, baseModel, codexStreamKeep, true, true, "cache-1")
+			_, _, ok, err := tt.exec.prepareCodexResponsesRequestBodyFast(context.Background(), nil,tt.req, tt.opts, from, to, baseModel, codexStreamKeep, true, true)
 			if err != nil {
 				t.Fatalf("prepareCodexResponsesRequestBodyFast error: %v", err)
 			}
