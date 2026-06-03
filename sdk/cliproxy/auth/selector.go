@@ -435,8 +435,9 @@ var sessionPattern = regexp.MustCompile(`_session_([a-f0-9-]+)$`)
 // It extracts session ID from multiple sources and maintains session-to-auth
 // mappings with automatic failover when the bound auth becomes unavailable.
 type SessionAffinitySelector struct {
-	fallback Selector
-	cache    *SessionCache
+	fallback       Selector
+	cache          *SessionCache
+	temporaryAuths *sessionAffinityTemporaryAuthStore
 }
 
 // SessionAffinityConfig configures the session affinity selector.
@@ -462,8 +463,9 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 		cfg.TTL = time.Hour
 	}
 	return &SessionAffinitySelector{
-		fallback: cfg.Fallback,
-		cache:    NewSessionCache(cfg.TTL),
+		fallback:       cfg.Fallback,
+		cache:          NewSessionCache(cfg.TTL),
+		temporaryAuths: newSessionAffinityTemporaryAuthStore(sessionAffinityTemporaryAuthTTL, sessionAffinityTemporaryAuthMaxFailures),
 	}
 }
 
@@ -486,32 +488,59 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 	if primaryID == "" {
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
-		return s.fallback.Pick(ctx, provider, model, opts, auths)
+		auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
+		s.rememberTemporaryLocalAuth(auth)
+		return auth, err
 	}
 
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now)
-	if err != nil {
-		return nil, err
-	}
+	available, errAvailable := getAvailableAuths(auths, provider, model, now)
 
 	cacheKey := provider + "::" + primaryID + "::" + model
 
 	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
-		for _, auth := range available {
-			if auth.ID == cachedAuthID {
-				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+		cachedAuthExistsLocally := sessionAffinityLocalAuthID(opts.Metadata, cachedAuthID)
+		if !cachedAuthExistsLocally {
+			cachedAuthExistsLocally = authListContainsID(auths, cachedAuthID)
+		}
+		if errAvailable == nil {
+			for _, auth := range available {
+				if auth.ID == cachedAuthID {
+					s.rememberTemporaryLocalAuth(auth)
+					entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+					return auth, nil
+				}
+			}
+		}
+		triedCachedAuth := sessionAffinityTriedAuthID(opts.Metadata, cachedAuthID)
+		if !cachedAuthExistsLocally && !triedCachedAuth {
+			if auth, okTemp := s.temporaryAuths.get(cachedAuthID); okTemp {
+				entry.Infof("session-affinity: local auth unavailable, using temporary memory auth | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return auth, nil
 			}
 		}
-		// Cached auth not available, reselect via fallback selector for even distribution
+		// Cached auth not available, reselect via fallback selector for even distribution.
+		// If a temporary auth has already failed in this request, preserve the original
+		// binding so future requests can retry it until the memory snapshot is evicted.
+		if errAvailable != nil {
+			return nil, errAvailable
+		}
 		auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
 		if err != nil {
 			return nil, err
 		}
-		s.cache.Set(cacheKey, auth.ID)
-		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+		s.rememberTemporaryLocalAuth(auth)
+		if !triedCachedAuth {
+			s.cache.Set(cacheKey, auth.ID)
+			entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+		} else {
+			entry.Infof("session-affinity: temporary auth already tried, using local fallback without rebinding | session=%s temporary_auth=%s fallback_auth=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, auth.ID, provider, model)
+		}
 		return auth, nil
+	}
+
+	if errAvailable != nil {
+		return nil, errAvailable
 	}
 
 	if fallbackID != "" && fallbackID != primaryID {
@@ -519,6 +548,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
 			for _, auth := range available {
 				if auth.ID == cachedAuthID {
+					s.rememberTemporaryLocalAuth(auth)
 					s.cache.Set(cacheKey, auth.ID)
 					entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
 					return auth, nil
@@ -531,9 +561,30 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if err != nil {
 		return nil, err
 	}
+	s.rememberTemporaryLocalAuth(auth)
 	s.cache.Set(cacheKey, auth.ID)
 	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
+}
+
+func (s *SessionAffinitySelector) rememberTemporaryLocalAuth(auth *Auth) {
+	if s == nil || s.temporaryAuths == nil || auth == nil || auth.temporaryAffinity {
+		return
+	}
+	s.temporaryAuths.rememberLocal(auth)
+}
+
+func authListContainsID(auths []*Auth, authID string) bool {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return false
+	}
+	for _, auth := range auths {
+		if auth != nil && auth.ID == authID {
+			return true
+		}
+	}
+	return false
 }
 
 func selectorLogEntry(ctx context.Context) *log.Entry {
@@ -559,6 +610,32 @@ func (s *SessionAffinitySelector) Stop() {
 	if s.cache != nil {
 		s.cache.Stop()
 	}
+}
+
+func (s *SessionAffinitySelector) HandleAuthRemoved(auth *Auth) bool {
+	if s == nil || s.temporaryAuths == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return false
+	}
+	s.temporaryAuths.markDeleted(auth)
+	return true
+}
+
+func (s *SessionAffinitySelector) RecordTemporaryAuthSuccess(auth *Auth) {
+	if s == nil || s.temporaryAuths == nil {
+		return
+	}
+	s.temporaryAuths.recordSuccess(auth)
+}
+
+func (s *SessionAffinitySelector) RecordTemporaryAuthFailure(auth *Auth, err error) bool {
+	if s == nil || s.temporaryAuths == nil {
+		return false
+	}
+	evicted := s.temporaryAuths.recordFailure(auth, err)
+	if evicted && auth != nil && strings.TrimSpace(auth.ID) != "" && s.cache != nil {
+		s.cache.InvalidateAuth(auth.ID)
+	}
+	return evicted
 }
 
 // InvalidateAuth removes all session bindings for a specific auth.

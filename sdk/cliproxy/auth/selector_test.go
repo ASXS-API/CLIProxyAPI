@@ -674,16 +674,15 @@ func TestSessionAffinitySelector_FailoverWhenAuthUnavailable(t *testing.T) {
 		t.Fatalf("Pick() error = %v", err)
 	}
 
-	// Remove the bound auth from available list (simulating rate limit)
-	availableWithoutFirst := make([]*Auth, 0, len(auths)-1)
+	// Mark the bound auth unavailable while keeping it in the local auth list.
 	for _, a := range auths {
-		if a.ID != first.ID {
-			availableWithoutFirst = append(availableWithoutFirst, a)
+		if a.ID == first.ID {
+			a.Disabled = true
 		}
 	}
 
 	// With failover enabled, should pick a new auth
-	second, err := selector.Pick(context.Background(), "claude", "claude-3", opts, availableWithoutFirst)
+	second, err := selector.Pick(context.Background(), "claude", "claude-3", opts, auths)
 	if err != nil {
 		t.Fatalf("Pick() after failover error = %v", err)
 	}
@@ -693,7 +692,7 @@ func TestSessionAffinitySelector_FailoverWhenAuthUnavailable(t *testing.T) {
 
 	// Subsequent picks should consistently return the new binding
 	for i := 0; i < 5; i++ {
-		got, _ := selector.Pick(context.Background(), "claude", "claude-3", opts, availableWithoutFirst)
+		got, _ := selector.Pick(context.Background(), "claude", "claude-3", opts, auths)
 		if got.ID != second.ID {
 			t.Fatalf("Pick() #%d after failover inconsistent: got %q, want %q", i, got.ID, second.ID)
 		}

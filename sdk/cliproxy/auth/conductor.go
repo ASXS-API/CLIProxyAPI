@@ -1214,6 +1214,7 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 		return
 	}
 	provider := strings.TrimSpace(existing.Provider)
+	removedAuth := existing.Clone()
 	delete(m.auths, id)
 	if m.modelPoolOffsets != nil {
 		delete(m.modelPoolOffsets, id)
@@ -1234,7 +1235,9 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 		m.scheduler.removeAuth(id)
 	}
 	m.queueRefreshUnschedule(id)
-	m.invalidateSessionAffinity(id)
+	if !m.handleSessionAffinityAuthRemoved(removedAuth) {
+		m.invalidateSessionAffinity(id)
+	}
 
 	if provider != "" {
 		if exec, ok := m.Executor(provider); ok && exec != nil {
@@ -1252,6 +1255,42 @@ func (m *Manager) invalidateSessionAffinity(authID string) {
 	if invalidator, ok := m.selector.(interface{ InvalidateAuth(string) }); ok && invalidator != nil {
 		invalidator.InvalidateAuth(authID)
 	}
+}
+
+func (m *Manager) handleSessionAffinityAuthRemoved(auth *Auth) bool {
+	if m == nil || auth == nil {
+		return false
+	}
+	if handler, ok := m.selector.(interface{ HandleAuthRemoved(*Auth) bool }); ok && handler != nil {
+		return handler.HandleAuthRemoved(auth)
+	}
+	return false
+}
+
+func (m *Manager) recordTemporaryAffinitySuccess(auth *Auth) {
+	if m == nil || auth == nil || !auth.temporaryAffinity {
+		return
+	}
+	if recorder, ok := m.selector.(interface{ RecordTemporaryAuthSuccess(*Auth) }); ok && recorder != nil {
+		recorder.RecordTemporaryAuthSuccess(auth)
+	}
+}
+
+func (m *Manager) recordTemporaryAffinityFailure(auth *Auth, err error) {
+	if m == nil || auth == nil || !auth.temporaryAffinity {
+		return
+	}
+	if recorder, ok := m.selector.(interface{ RecordTemporaryAuthFailure(*Auth, error) bool }); ok && recorder != nil {
+		recorder.RecordTemporaryAuthFailure(auth, err)
+	}
+}
+
+func selectorSupportsTemporaryAffinity(selector Selector) bool {
+	if selector == nil {
+		return false
+	}
+	_, ok := selector.(interface{ RecordTemporaryAuthFailure(*Auth, error) bool })
+	return ok
 }
 
 // Load resets manager state from the backing store.
@@ -1445,6 +1484,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				result.Error.HTTPStatus = se.StatusCode()
 			}
 			m.MarkResult(execCtx, result)
+			m.recordTemporaryAffinityFailure(auth, errPrepare)
 			lastErr = errPrepare
 			continue
 		}
@@ -1467,6 +1507,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					result.RetryAfter = ra
 				}
 				m.MarkResult(execCtx, result)
+				m.recordTemporaryAffinityFailure(auth, errExec)
 				if isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
@@ -1474,6 +1515,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				continue
 			}
 			m.MarkResult(execCtx, result)
+			m.recordTemporaryAffinitySuccess(auth)
 			return resp, nil
 		}
 		if authErr != nil {
@@ -1544,6 +1586,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				result.Error.HTTPStatus = se.StatusCode()
 			}
 			m.MarkResult(execCtx, result)
+			m.recordTemporaryAffinityFailure(auth, errPrepare)
 			lastErr = errPrepare
 			continue
 		}
@@ -1566,6 +1609,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					result.RetryAfter = ra
 				}
 				m.MarkResult(execCtx, result)
+				m.recordTemporaryAffinityFailure(auth, errExec)
 				if isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
@@ -1573,6 +1617,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				continue
 			}
 			m.MarkResult(execCtx, result)
+			m.recordTemporaryAffinitySuccess(auth)
 			return resp, nil
 		}
 		if authErr != nil {
@@ -1641,6 +1686,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				result.Error.HTTPStatus = se.StatusCode()
 			}
 			m.MarkResult(execCtx, result)
+			m.recordTemporaryAffinityFailure(auth, errPrepare)
 			lastErr = errPrepare
 			continue
 		}
@@ -1650,6 +1696,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
 			}
+			m.recordTemporaryAffinityFailure(auth, errStream)
 			if isRequestInvalidError(errStream) {
 				return nil, errStream
 			}
@@ -1659,6 +1706,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			continue
 		}
+		m.recordTemporaryAffinitySuccess(auth)
 		return streamResult, nil
 	}
 }
@@ -3156,6 +3204,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		return nil, nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
 	candidates := make([]*Auth, 0, len(m.auths))
+	localAuthIDs := make(map[string]struct{})
 	modelKey := strings.TrimSpace(model)
 	// Always use base model name (without thinking suffix) for auth matching.
 	if modelKey != "" {
@@ -3166,10 +3215,14 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	}
 	registryRef := registry.GetGlobalRegistry()
 	for _, candidate := range m.auths {
-		if candidate.Provider != provider || candidate.Disabled {
+		if candidate == nil || candidate.Provider != provider {
 			continue
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
+			continue
+		}
+		localAuthIDs[candidate.ID] = struct{}{}
+		if candidate.Disabled {
 			continue
 		}
 		if disallowFreeAuth && isFreeCodexAuth(candidate) {
@@ -3184,6 +3237,19 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		candidates = append(candidates, candidate)
 	}
 	if len(candidates) == 0 {
+		if selectorSupportsTemporaryAffinity(m.selector) {
+			m.mu.RUnlock()
+			selectorOpts := withSessionAffinityTriedAuthIDs(opts, tried)
+			selectorOpts = withSessionAffinityLocalAuthIDs(selectorOpts, localAuthIDs)
+			selected, errPick := m.selector.Pick(ctx, provider, selectionArgForSelector(m.selector, model), selectorOpts, nil)
+			if errPick != nil {
+				return nil, nil, errPick
+			}
+			if selected == nil {
+				return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+			}
+			return selected.Clone(), executor, nil
+		}
 		m.mu.RUnlock()
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
@@ -3192,7 +3258,13 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		m.mu.RUnlock()
 		return nil, nil, errAvailable
 	}
-	selected, errPick := m.selector.Pick(ctx, provider, selectionArgForSelector(m.selector, model), opts, available)
+	selectorOpts := withSessionAffinityTriedAuthIDs(opts, tried)
+	selectorOpts = withSessionAffinityLocalAuthIDs(selectorOpts, localAuthIDs)
+	selectorAuths := available
+	if selectorSupportsTemporaryAffinity(m.selector) {
+		selectorAuths = candidates
+	}
+	selected, errPick := m.selector.Pick(ctx, provider, selectionArgForSelector(m.selector, model), selectorOpts, selectorAuths)
 	if errPick != nil {
 		m.mu.RUnlock()
 		return nil, nil, errPick
@@ -3298,6 +3370,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 
 	m.mu.RLock()
 	candidates := make([]*Auth, 0, len(m.auths))
+	localAuthIDs := make(map[string]struct{})
 	modelKey := strings.TrimSpace(model)
 	// Always use base model name (without thinking suffix) for auth matching.
 	if modelKey != "" {
@@ -3308,7 +3381,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	}
 	registryRef := registry.GetGlobalRegistry()
 	for _, candidate := range m.auths {
-		if candidate == nil || candidate.Disabled {
+		if candidate == nil {
 			continue
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
@@ -3324,6 +3397,10 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if _, ok := providerSet[providerKey]; !ok {
 			continue
 		}
+		localAuthIDs[candidate.ID] = struct{}{}
+		if candidate.Disabled {
+			continue
+		}
 		if _, used := tried[candidate.ID]; used {
 			continue
 		}
@@ -3336,6 +3413,27 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		candidates = append(candidates, candidate)
 	}
 	if len(candidates) == 0 {
+		if selectorSupportsTemporaryAffinity(m.selector) {
+			m.mu.RUnlock()
+			selectorOpts := withSessionAffinityTriedAuthIDs(opts, tried)
+			selectorOpts = withSessionAffinityLocalAuthIDs(selectorOpts, localAuthIDs)
+			selected, errPick := m.selector.Pick(ctx, "mixed", selectionArgForSelector(m.selector, model), selectorOpts, nil)
+			if errPick != nil {
+				return nil, nil, "", errPick
+			}
+			if selected == nil {
+				return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+			}
+			providerKey := strings.TrimSpace(strings.ToLower(selected.Provider))
+			if _, ok := providerSet[providerKey]; !ok {
+				return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
+			}
+			executor, okExecutor := m.Executor(providerKey)
+			if !okExecutor {
+				return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}
+			}
+			return selected.Clone(), executor, providerKey, nil
+		}
 		m.mu.RUnlock()
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
@@ -3344,7 +3442,13 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		m.mu.RUnlock()
 		return nil, nil, "", errAvailable
 	}
-	selected, errPick := m.selector.Pick(ctx, "mixed", selectionArgForSelector(m.selector, model), opts, available)
+	selectorOpts := withSessionAffinityTriedAuthIDs(opts, tried)
+	selectorOpts = withSessionAffinityLocalAuthIDs(selectorOpts, localAuthIDs)
+	selectorAuths := available
+	if selectorSupportsTemporaryAffinity(m.selector) {
+		selectorAuths = candidates
+	}
+	selected, errPick := m.selector.Pick(ctx, "mixed", selectionArgForSelector(m.selector, model), selectorOpts, selectorAuths)
 	if errPick != nil {
 		m.mu.RUnlock()
 		return nil, nil, "", errPick
