@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptrace"
+	"net/url"
 	"strings"
 	"time"
 
@@ -40,6 +41,16 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		authProxyURL := strings.TrimSpace(auth.ProxyURL)
 		if authProxyURL != "" {
 			if transport := buildProxyTransport(authProxyURL); transport != nil {
+				httpClient.Transport = newConfiguredUpstreamRoundTripper(ctx, cfg, provider, newInactiveProxyReuseRoundTripper(ctx, transport, provider, proxyReuseReasonAuthProxy))
+				return httpClient
+			}
+			httpClient.Transport = newConfiguredUpstreamRoundTripper(ctx, cfg, provider, newInactiveProxyReuseRoundTripper(ctx, roundTripperFromContext(ctx), provider, proxyReuseReasonBuildFailed))
+			return httpClient
+		}
+		// Priority 1.5: credential-egress proxy — per-credential sticky egress,
+		// kept isolated per credential like an explicit auth proxy.
+		if egressProxyURL := credentialEgressProxyURL(cfg, auth); egressProxyURL != "" {
+			if transport := buildProxyTransport(egressProxyURL); transport != nil {
 				httpClient.Transport = newConfiguredUpstreamRoundTripper(ctx, cfg, provider, newInactiveProxyReuseRoundTripper(ctx, transport, provider, proxyReuseReasonAuthProxy))
 				return httpClient
 			}
@@ -130,4 +141,65 @@ func buildProxyTransport(proxyURL string) *http.Transport {
 		return nil
 	}
 	return transport
+}
+
+// EffectiveProxyURL resolves the proxy URL a credential should use for outbound
+// upstream traffic, in precedence order:
+//  1. auth.ProxyURL — explicit per-credential override (including "direct"/"none")
+//  2. credential-egress proxy — cfg.CredentialEgressProxy with the credential's
+//     stable index injected as the username (auto per-credential sticky egress)
+//  3. cfg.ProxyURL — the global proxy
+//
+// Call sites that take a single resolved proxy URL string (auth refresh clients,
+// websocket/utls dialers) should use this so all outbound paths for a credential
+// share the same egress identity.
+func EffectiveProxyURL(cfg *config.Config, auth *cliproxyauth.Auth) string {
+	if auth != nil {
+		if explicit := strings.TrimSpace(auth.ProxyURL); explicit != "" {
+			return explicit
+		}
+	}
+	if egress := credentialEgressProxyURL(cfg, auth); egress != "" {
+		return egress
+	}
+	if cfg != nil {
+		return strings.TrimSpace(cfg.ProxyURL)
+	}
+	return ""
+}
+
+// credentialEgressProxyURL returns the configured credential-egress proxy URL
+// with the credential's stable index injected as the username, or "" when the
+// feature is unconfigured or the credential has no derivable index.
+func credentialEgressProxyURL(cfg *config.Config, auth *cliproxyauth.Auth) string {
+	if cfg == nil || auth == nil {
+		return ""
+	}
+	base := strings.TrimSpace(cfg.CredentialEgressProxy)
+	if base == "" {
+		return ""
+	}
+	idx := strings.TrimSpace(auth.EnsureIndex())
+	if idx == "" {
+		return ""
+	}
+	return injectProxyUsername(base, idx)
+}
+
+// injectProxyUsername sets the userinfo username of a proxy URL to username,
+// preserving any configured password (used as the shared secret) and the
+// scheme/host. Returns "" if the base URL cannot be parsed.
+func injectProxyUsername(base, username string) string {
+	u, err := url.Parse(base)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	password := ""
+	if u.User != nil {
+		if pw, ok := u.User.Password(); ok {
+			password = pw
+		}
+	}
+	u.User = url.UserPassword(username, password)
+	return u.String()
 }

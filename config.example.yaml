@@ -83,6 +83,14 @@ redis-usage-queue-retention-seconds: 60
 # Per-entry proxy-url also supports "direct" or "none" to bypass both the global proxy-url and environment proxies explicitly.
 proxy-url: ""
 
+# Credential-egress proxy: when set, every credential that has no explicit
+# per-credential proxy-url is routed through this proxy, with the credential's
+# stable index auto-injected as the proxy username. Paired with a proxy that
+# maps username -> source IP (e.g. an IPv6 /78 pool via v6pool-proxy), this gives
+# each credential a deterministic sticky egress IP with zero per-credential
+# config. Put the shared secret in the password field. Leave empty to disable.
+credential-egress-proxy: ""
+
 # When true, unprefixed model requests only use credentials without a prefix (except when prefix == model name).
 force-model-prefix: false
 

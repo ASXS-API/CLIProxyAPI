@@ -86,6 +86,16 @@ type Config struct {
 	// MaxRetryCredentials defines the maximum number of credentials to try for a failed request.
 	// Set to 0 or a negative value to keep trying all available credentials (legacy behavior).
 	MaxRetryCredentials int `yaml:"max-retry-credentials" json:"max-retry-credentials"`
+
+	// CredentialEgressProxy, when set, routes every credential that has no
+	// explicit per-credential proxy-url through this proxy, automatically
+	// injecting the credential's stable index (auth.EnsureIndex) as the proxy
+	// username. Paired with an upstream proxy that maps username -> source IP
+	// (e.g. v6pool-proxy over an IPv6 /78), this gives each credential a
+	// deterministic sticky egress IP with zero per-credential configuration.
+	// The value should carry the shared secret as the password, e.g.
+	// "socks5://:<secret>@172.18.0.1:1080".
+	CredentialEgressProxy string `yaml:"credential-egress-proxy" json:"credential-egress-proxy"`
 	// MaxRetryInterval defines the maximum wait before retrying a cooled-down credential.
 	// Numeric values are seconds; duration strings like "300ms" are also accepted.
 	MaxRetryInterval RetryIntervalSeconds `yaml:"max-retry-interval" json:"max-retry-interval"`
