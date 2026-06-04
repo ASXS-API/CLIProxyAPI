@@ -1267,21 +1267,41 @@ func (m *Manager) handleSessionAffinityAuthRemoved(auth *Auth) bool {
 	return false
 }
 
-func (m *Manager) recordTemporaryAffinitySuccess(auth *Auth) {
+func (m *Manager) recordTemporaryAffinitySuccess(ctx context.Context, auth *Auth, stage string) {
 	if m == nil || auth == nil || !auth.temporaryAffinity {
 		return
 	}
+	logEntryWithRequestID(ctx).Infof(
+		"session-affinity temporary auth: execution succeeded | auth=%s stage=%s",
+		temporaryAuthLogName(auth),
+		strings.TrimSpace(stage),
+	)
 	if recorder, ok := m.selector.(interface{ RecordTemporaryAuthSuccess(*Auth) }); ok && recorder != nil {
 		recorder.RecordTemporaryAuthSuccess(auth)
 	}
 }
 
-func (m *Manager) recordTemporaryAffinityFailure(auth *Auth, err error) {
+func (m *Manager) recordTemporaryAffinityFailure(ctx context.Context, auth *Auth, err error, stage string) {
 	if m == nil || auth == nil || !auth.temporaryAffinity {
 		return
 	}
+	logEntryWithRequestID(ctx).Warnf(
+		"session-affinity temporary auth: execution failed | auth=%s stage=%s error=%s",
+		temporaryAuthLogName(auth),
+		strings.TrimSpace(stage),
+		summarizeTemporaryAuthError(err),
+	)
 	if recorder, ok := m.selector.(interface{ RecordTemporaryAuthFailure(*Auth, error) bool }); ok && recorder != nil {
 		recorder.RecordTemporaryAuthFailure(auth, err)
+	}
+}
+
+func (m *Manager) recordSessionAffinityFallbackSuccess(auth *Auth) {
+	if m == nil || auth == nil {
+		return
+	}
+	if recorder, ok := m.selector.(interface{ RecordFallbackAuthSuccess(*Auth) bool }); ok && recorder != nil {
+		recorder.RecordFallbackAuthSuccess(auth)
 	}
 }
 
@@ -1484,7 +1504,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				result.Error.HTTPStatus = se.StatusCode()
 			}
 			m.MarkResult(execCtx, result)
-			m.recordTemporaryAffinityFailure(auth, errPrepare)
+			m.recordTemporaryAffinityFailure(execCtx, auth, errPrepare, "prepare")
 			lastErr = errPrepare
 			continue
 		}
@@ -1507,7 +1527,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					result.RetryAfter = ra
 				}
 				m.MarkResult(execCtx, result)
-				m.recordTemporaryAffinityFailure(auth, errExec)
+				m.recordTemporaryAffinityFailure(execCtx, auth, errExec, "execute")
 				if isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
@@ -1515,7 +1535,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				continue
 			}
 			m.MarkResult(execCtx, result)
-			m.recordTemporaryAffinitySuccess(auth)
+			m.recordTemporaryAffinitySuccess(execCtx, auth, "execute")
+			m.recordSessionAffinityFallbackSuccess(auth)
 			return resp, nil
 		}
 		if authErr != nil {
@@ -1586,7 +1607,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				result.Error.HTTPStatus = se.StatusCode()
 			}
 			m.MarkResult(execCtx, result)
-			m.recordTemporaryAffinityFailure(auth, errPrepare)
+			m.recordTemporaryAffinityFailure(execCtx, auth, errPrepare, "prepare")
 			lastErr = errPrepare
 			continue
 		}
@@ -1609,7 +1630,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					result.RetryAfter = ra
 				}
 				m.MarkResult(execCtx, result)
-				m.recordTemporaryAffinityFailure(auth, errExec)
+				m.recordTemporaryAffinityFailure(execCtx, auth, errExec, "count_tokens")
 				if isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
@@ -1617,7 +1638,8 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				continue
 			}
 			m.MarkResult(execCtx, result)
-			m.recordTemporaryAffinitySuccess(auth)
+			m.recordTemporaryAffinitySuccess(execCtx, auth, "count_tokens")
+			m.recordSessionAffinityFallbackSuccess(auth)
 			return resp, nil
 		}
 		if authErr != nil {
@@ -1686,7 +1708,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				result.Error.HTTPStatus = se.StatusCode()
 			}
 			m.MarkResult(execCtx, result)
-			m.recordTemporaryAffinityFailure(auth, errPrepare)
+			m.recordTemporaryAffinityFailure(execCtx, auth, errPrepare, "prepare")
 			lastErr = errPrepare
 			continue
 		}
@@ -1696,7 +1718,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
 			}
-			m.recordTemporaryAffinityFailure(auth, errStream)
+			m.recordTemporaryAffinityFailure(execCtx, auth, errStream, "stream")
 			if isRequestInvalidError(errStream) {
 				return nil, errStream
 			}
@@ -1706,7 +1728,8 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			continue
 		}
-		m.recordTemporaryAffinitySuccess(auth)
+		m.recordTemporaryAffinitySuccess(execCtx, auth, "stream")
+		m.recordSessionAffinityFallbackSuccess(auth)
 		return streamResult, nil
 	}
 }
@@ -1804,6 +1827,13 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 	if m == nil || executor == nil || auth == nil {
 		return auth, nil
 	}
+	rebind := auth.sessionAffinityRebind
+	withTransientSelectionState := func(prepared *Auth) *Auth {
+		if prepared != nil && rebind.cacheKey != "" {
+			prepared.sessionAffinityRebind = rebind
+		}
+		return prepared
+	}
 	preparer, ok := executor.(RequestAuthPreparer)
 	if !ok || preparer == nil || !preparer.ShouldPrepareRequestAuth(auth) {
 		return auth, nil
@@ -1811,13 +1841,15 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 
 	id := strings.TrimSpace(auth.ID)
 	if id == "" {
-		return preparer.PrepareRequestAuth(ctx, auth.Clone())
+		updated, errPrepare := preparer.PrepareRequestAuth(ctx, auth.Clone())
+		return withTransientSelectionState(updated), errPrepare
 	}
 
 	lockValue, _ := m.requestPrepareLocks.LoadOrStore(id, &requestAuthPrepareLock{})
 	lock, ok := lockValue.(*requestAuthPrepareLock)
 	if !ok || lock == nil {
-		return preparer.PrepareRequestAuth(ctx, auth.Clone())
+		updated, errPrepare := preparer.PrepareRequestAuth(ctx, auth.Clone())
+		return withTransientSelectionState(updated), errPrepare
 	}
 
 	lock.mu.Lock()
@@ -1831,7 +1863,7 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 	m.mu.RUnlock()
 
 	if !preparer.ShouldPrepareRequestAuth(target) {
-		return target, nil
+		return withTransientSelectionState(target), nil
 	}
 
 	updated, errPrepare := preparer.PrepareRequestAuth(ctx, target)
@@ -1839,17 +1871,17 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 		return auth, errPrepare
 	}
 	if updated == nil {
-		return target, nil
+		return withTransientSelectionState(target), nil
 	}
 
 	saved, errUpdate := m.Update(ctx, updated)
 	if errUpdate != nil {
-		return updated, errUpdate
+		return withTransientSelectionState(updated), errUpdate
 	}
 	if saved != nil {
-		return saved, nil
+		return withTransientSelectionState(saved), nil
 	}
-	return updated, nil
+	return withTransientSelectionState(updated), nil
 }
 
 func contextWithRequestedModelAlias(ctx context.Context, opts cliproxyexecutor.Options, fallback string) context.Context {
@@ -3276,10 +3308,12 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	authCopy := selected.Clone()
 	m.mu.RUnlock()
 	if !selected.indexAssigned {
+		rebind := authCopy.sessionAffinityRebind
 		m.mu.Lock()
 		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
 			current.EnsureIndex()
 			authCopy = current.Clone()
+			authCopy.sessionAffinityRebind = rebind
 		}
 		m.mu.Unlock()
 	}
@@ -3337,10 +3371,12 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		}
 		authCopy := selected.Clone()
 		if !selected.indexAssigned {
+			rebind := authCopy.sessionAffinityRebind
 			m.mu.Lock()
 			if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
 				current.EnsureIndex()
 				authCopy = current.Clone()
+				authCopy.sessionAffinityRebind = rebind
 			}
 			m.mu.Unlock()
 		}
@@ -3466,10 +3502,12 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	authCopy := selected.Clone()
 	m.mu.RUnlock()
 	if !selected.indexAssigned {
+		rebind := authCopy.sessionAffinityRebind
 		m.mu.Lock()
 		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
 			current.EnsureIndex()
 			authCopy = current.Clone()
+			authCopy.sessionAffinityRebind = rebind
 		}
 		m.mu.Unlock()
 	}
@@ -3554,10 +3592,12 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		}
 		authCopy := selected.Clone()
 		if !selected.indexAssigned {
+			rebind := authCopy.sessionAffinityRebind
 			m.mu.Lock()
 			if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
 				current.EnsureIndex()
 				authCopy = current.Clone()
+				authCopy.sessionAffinityRebind = rebind
 			}
 			m.mu.Unlock()
 		}

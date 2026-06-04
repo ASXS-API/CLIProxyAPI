@@ -5,6 +5,20 @@ import cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/ex
 const sessionAffinityTriedAuthIDsMetadataKey = "session_affinity_tried_auth_ids"
 const sessionAffinityLocalAuthIDsMetadataKey = "session_affinity_local_auth_ids"
 
+type sessionAffinityRebind struct {
+	cacheKey       string
+	sessionID      string
+	previousAuthID string
+	fallbackAuthID string
+}
+
+func (r sessionAffinityRebind) validFor(auth *Auth) bool {
+	if auth == nil || auth.temporaryAffinity {
+		return false
+	}
+	return r.cacheKey != "" && r.fallbackAuthID != "" && r.fallbackAuthID == auth.ID
+}
+
 func withSessionAffinityTriedAuthIDs(opts cliproxyexecutor.Options, tried map[string]struct{}) cliproxyexecutor.Options {
 	if len(tried) == 0 {
 		return opts

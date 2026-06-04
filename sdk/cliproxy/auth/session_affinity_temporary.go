@@ -18,6 +18,7 @@ type sessionAffinityTemporaryAuthEntry struct {
 	auth                *Auth
 	expiresAt           time.Time
 	deletedAt           time.Time
+	hitCount            int
 	successCount        int
 	failureCount        int
 	consecutiveFailures int
@@ -102,6 +103,7 @@ func (s *sessionAffinityTemporaryAuthStore) get(authID string) (*Auth, bool) {
 		s.deleteLocked(authID, entry, "ttl_expired")
 		return nil, false
 	}
+	entry.hitCount++
 	entry.expiresAt = now.Add(s.ttl)
 	out := entry.auth.Clone()
 	out.temporaryAffinity = true
@@ -125,9 +127,10 @@ func (s *sessionAffinityTemporaryAuthStore) recordSuccess(auth *Auth) {
 	entry.lastSuccessAt = now
 	entry.expiresAt = now.Add(s.ttl)
 	log.Infof(
-		"session-affinity temporary auth: memory auth succeeded after local miss | auth=%s deleted_at=%s success_count=%d failure_count=%d",
+		"session-affinity temporary auth: memory auth succeeded after local miss | auth=%s deleted_at=%s hit_count=%d success_count=%d failure_count=%d",
 		temporaryAuthLogName(entry.auth),
 		formatTemporaryAuthTime(entry.deletedAt),
+		entry.hitCount,
 		entry.successCount,
 		entry.failureCount,
 	)
@@ -149,9 +152,10 @@ func (s *sessionAffinityTemporaryAuthStore) recordFailure(auth *Auth, err error)
 	entry.lastFailureAt = now
 	entry.expiresAt = now.Add(s.ttl)
 	log.Warnf(
-		"session-affinity temporary auth: memory auth failed after local miss | auth=%s deleted_at=%s consecutive_failures=%d failure_count=%d error=%s",
+		"session-affinity temporary auth: memory auth failed after local miss | auth=%s deleted_at=%s hit_count=%d consecutive_failures=%d failure_count=%d error=%s",
 		temporaryAuthLogName(entry.auth),
 		formatTemporaryAuthTime(entry.deletedAt),
+		entry.hitCount,
 		entry.consecutiveFailures,
 		entry.failureCount,
 		summarizeTemporaryAuthError(err),
@@ -180,9 +184,10 @@ func (s *sessionAffinityTemporaryAuthStore) deleteLocked(authID string, entry *s
 		return
 	}
 	log.Infof(
-		"session-affinity temporary auth: lifecycle ended | auth=%s deleted_at=%s success_count=%d failure_count=%d reason=%s",
+		"session-affinity temporary auth: lifecycle ended | auth=%s deleted_at=%s hit_count=%d success_count=%d failure_count=%d reason=%s",
 		temporaryAuthLogName(entry.auth),
 		formatTemporaryAuthTime(entry.deletedAt),
+		entry.hitCount,
 		entry.successCount,
 		entry.failureCount,
 		reason,

@@ -20,6 +20,7 @@ type temporaryAffinityTestExecutor struct {
 	mu             sync.Mutex
 	calls          []temporaryAffinityTestCall
 	failTemporary  bool
+	failAuthIDs    map[string]bool
 	temporaryFails int
 }
 
@@ -37,6 +38,9 @@ func (e *temporaryAffinityTestExecutor) Execute(_ context.Context, auth *Auth, _
 	if e.failTemporary && call.temporary {
 		e.temporaryFails++
 		return cliproxyexecutor.Response{}, errors.New("temporary auth failed")
+	}
+	if e.failAuthIDs != nil && e.failAuthIDs[call.authID] {
+		return cliproxyexecutor.Response{}, errors.New("auth failed")
 	}
 	return cliproxyexecutor.Response{Payload: []byte(call.authID)}, nil
 }
@@ -127,7 +131,7 @@ func TestManagerExecute_SessionAffinityUsesTemporaryAuthAfterRemoval(t *testing.
 	}
 }
 
-func TestManagerExecute_TemporaryAuthFailureFallsBackAndEvicts(t *testing.T) {
+func TestManagerExecute_TemporaryAuthFailureRebindsAfterFallbackSuccess(t *testing.T) {
 	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
 		Fallback: &RoundRobinSelector{},
 		TTL:      time.Hour,
@@ -143,14 +147,12 @@ func TestManagerExecute_TemporaryAuthFailureFallsBackAndEvicts(t *testing.T) {
 	}
 	manager.Remove(ctx, "auth-a")
 
-	for i := 0; i < sessionAffinityTemporaryAuthMaxFailures; i++ {
-		resp, err := manager.Execute(ctx, []string{"codex"}, req, opts)
-		if err != nil {
-			t.Fatalf("Execute after removal #%d: %v", i+1, err)
-		}
-		if string(resp.Payload) != "auth-b" {
-			t.Fatalf("Execute after removal #%d payload = %q, want auth-b fallback", i+1, string(resp.Payload))
-		}
+	resp, err := manager.Execute(ctx, []string{"codex"}, req, opts)
+	if err != nil {
+		t.Fatalf("Execute after removal: %v", err)
+	}
+	if string(resp.Payload) != "auth-b" {
+		t.Fatalf("payload after removal = %q, want auth-b fallback", string(resp.Payload))
 	}
 
 	calls := executor.snapshotCalls()
@@ -160,22 +162,66 @@ func TestManagerExecute_TemporaryAuthFailureFallsBackAndEvicts(t *testing.T) {
 			tempFailures++
 		}
 	}
-	if tempFailures != sessionAffinityTemporaryAuthMaxFailures {
-		t.Fatalf("temporary auth failures = %d, want %d; calls=%+v", tempFailures, sessionAffinityTemporaryAuthMaxFailures, calls)
+	if tempFailures != 1 {
+		t.Fatalf("temporary auth failures = %d, want 1; calls=%+v", tempFailures, calls)
 	}
+
+	resp, err = manager.Execute(ctx, []string{"codex"}, req, opts)
+	if err != nil {
+		t.Fatalf("Execute after successful fallback rebind: %v", err)
+	}
+	if string(resp.Payload) != "auth-b" {
+		t.Fatalf("payload after successful fallback rebind = %q, want auth-b", string(resp.Payload))
+	}
+	callsAfterRebind := executor.snapshotCalls()
+	for _, call := range callsAfterRebind[len(calls):] {
+		if call.authID == "auth-a" && call.temporary {
+			t.Fatalf("temporary auth was retried after successful fallback rebind; new calls=%+v", callsAfterRebind[len(calls):])
+		}
+	}
+}
+
+func TestManagerExecute_TemporaryAuthFailureDoesNotRebindUntilFallbackSucceeds(t *testing.T) {
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &RoundRobinSelector{},
+		TTL:      time.Hour,
+	})
+	defer selector.Stop()
+	manager, executor := newTemporaryAffinityTestManager(t, selector)
+	executor.failTemporary = true
+	executor.failAuthIDs = map[string]bool{"auth-b": true}
+	req, opts := temporaryAffinityRequest()
+	ctx := context.Background()
+
+	if _, err := manager.Execute(ctx, []string{"codex"}, req, opts); err != nil {
+		t.Fatalf("initial Execute: %v", err)
+	}
+	manager.Remove(ctx, "auth-a")
+
+	if _, err := manager.Execute(ctx, []string{"codex"}, req, opts); err == nil {
+		t.Fatalf("Execute after removal with failing fallback succeeded, want error")
+	}
+
+	callsAfterFailure := executor.snapshotCalls()
+	executor.failAuthIDs["auth-b"] = false
 
 	resp, err := manager.Execute(ctx, []string{"codex"}, req, opts)
 	if err != nil {
-		t.Fatalf("Execute after eviction: %v", err)
+		t.Fatalf("Execute after fallback recovery: %v", err)
 	}
 	if string(resp.Payload) != "auth-b" {
-		t.Fatalf("payload after eviction = %q, want auth-b", string(resp.Payload))
+		t.Fatalf("payload after fallback recovery = %q, want auth-b", string(resp.Payload))
 	}
-	callsAfterEviction := executor.snapshotCalls()
-	for _, call := range callsAfterEviction[len(calls):] {
-		if call.authID == "auth-a" && call.temporary {
-			t.Fatalf("temporary auth was retried after eviction; new calls=%+v", callsAfterEviction[len(calls):])
-		}
+
+	newCalls := executor.snapshotCalls()[len(callsAfterFailure):]
+	if len(newCalls) < 2 {
+		t.Fatalf("new calls = %+v, want temporary auth-a followed by auth-b", newCalls)
+	}
+	if !newCalls[0].temporary || newCalls[0].authID != "auth-a" {
+		t.Fatalf("first retry call = %+v, want temporary auth-a before rebind", newCalls[0])
+	}
+	if newCalls[len(newCalls)-1].temporary || newCalls[len(newCalls)-1].authID != "auth-b" {
+		t.Fatalf("last retry call = %+v, want successful auth-b fallback", newCalls[len(newCalls)-1])
 	}
 }
 

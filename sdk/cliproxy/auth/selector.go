@@ -534,7 +534,14 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			s.cache.Set(cacheKey, auth.ID)
 			entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 		} else {
-			entry.Infof("session-affinity: temporary auth already tried, using local fallback without rebinding | session=%s temporary_auth=%s fallback_auth=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, auth.ID, provider, model)
+			auth = auth.Clone()
+			auth.sessionAffinityRebind = sessionAffinityRebind{
+				cacheKey:       cacheKey,
+				sessionID:      primaryID,
+				previousAuthID: cachedAuthID,
+				fallbackAuthID: auth.ID,
+			}
+			entry.Infof("session-affinity: temporary auth already tried, using local fallback pending success rebind | session=%s temporary_auth=%s fallback_auth=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, auth.ID, provider, model)
 		}
 		return auth, nil
 	}
@@ -636,6 +643,24 @@ func (s *SessionAffinitySelector) RecordTemporaryAuthFailure(auth *Auth, err err
 		s.cache.InvalidateAuth(auth.ID)
 	}
 	return evicted
+}
+
+func (s *SessionAffinitySelector) RecordFallbackAuthSuccess(auth *Auth) bool {
+	if s == nil || s.cache == nil || auth == nil {
+		return false
+	}
+	rebind := auth.sessionAffinityRebind
+	if !rebind.validFor(auth) {
+		return false
+	}
+	s.cache.Set(rebind.cacheKey, auth.ID)
+	log.Infof(
+		"session-affinity: fallback auth succeeded, rebound session | session=%s previous_auth=%s auth=%s",
+		truncateSessionID(rebind.sessionID),
+		rebind.previousAuthID,
+		auth.ID,
+	)
+	return true
 }
 
 // InvalidateAuth removes all session bindings for a specific auth.
