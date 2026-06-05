@@ -141,6 +141,35 @@ func TestSessionAffinity_DetachExceededSessionWhenLiveAvailable(t *testing.T) {
 	}
 }
 
+// TestFilterExecutionModels_TemporaryAffinityBypassesBlocked verifies that a
+// temporary (in-memory) credential whose frozen snapshot is marked unavailable
+// is still attempted, so residual value can be squeezed out of it.
+func TestFilterExecutionModels_TemporaryAffinityBypassesBlocked(t *testing.T) {
+	m := NewManager(nil, &RoundRobinSelector{}, nil)
+	auth := &Auth{
+		ID:       "blocked-1",
+		Provider: "codex",
+		Status:   StatusActive,
+		ModelStates: map[string]*ModelState{
+			"gpt-5.5": {Unavailable: true, NextRetryAfter: timeNowPlusHour()},
+		},
+	}
+
+	// A normal credential with a blocked model yields no executable models.
+	if got := m.filterExecutionModels(auth, "gpt-5.5", []string{"gpt-5.5"}, false); len(got) != 0 {
+		t.Fatalf("blocked non-temporary auth should yield no models, got %v", got)
+	}
+
+	// The same credential as a temporary-affinity snapshot bypasses the block.
+	auth.temporaryAffinity = true
+	got := m.filterExecutionModels(auth, "gpt-5.5", []string{"gpt-5.5"}, false)
+	if len(got) != 1 || got[0] != "gpt-5.5" {
+		t.Fatalf("temporary-affinity auth must bypass the blocked filter, got %v", got)
+	}
+}
+
+func timeNowPlusHour() time.Time { return time.Now().Add(time.Hour) }
+
 // TestSessionAffinity_KeepTemporaryWhenNoLiveAvailable verifies that an exceeded
 // session keeps using the temporary credential (degraded) rather than hard
 // failing when there is no live credential to take over.

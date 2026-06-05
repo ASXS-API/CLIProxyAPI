@@ -620,6 +620,19 @@ func (m *Manager) filterExecutionModels(auth *Auth, routeModel string, candidate
 	if len(candidates) == 0 {
 		return nil
 	}
+	// Temporary (in-memory) affinity credentials are the frozen snapshot of an
+	// already removed account. Their snapshot may carry a stale Unavailable /
+	// cooldown state captured at removal time. We intentionally bypass the
+	// blocked-model filter here: the whole purpose of the in-memory credential is
+	// to squeeze residual value out of the (possibly revoked) token for sessions
+	// established before removal, so the request MUST be attempted regardless of
+	// that frozen state. A failure still falls back to a live credential within
+	// the same request, so the end user is unaffected.
+	if auth != nil && auth.temporaryAffinity {
+		out := make([]string, len(candidates))
+		copy(out, candidates)
+		return out
+	}
 	now := time.Now()
 	out := make([]string, 0, len(candidates))
 	for _, upstreamModel := range candidates {
