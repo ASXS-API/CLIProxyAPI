@@ -141,6 +141,23 @@ func TestSessionAffinity_DetachExceededSessionWhenLiveAvailable(t *testing.T) {
 	}
 }
 
+// TestAuth_IsTemporaryAffinity verifies the exported accessor used by executors
+// (e.g. to preserve previous_response_id) reflects the snapshot state.
+func TestAuth_IsTemporaryAffinity(t *testing.T) {
+	store := newSessionAffinityTemporaryAuthStore(time.Hour, 5)
+	defer store.Stop()
+	src := &Auth{ID: "a", Provider: "codex", Status: StatusActive}
+	if src.IsTemporaryAffinity() {
+		t.Fatalf("a freshly built auth must not report temporary-affinity")
+	}
+	store.rememberLocal(src)
+	store.markDeleted(src)
+	tmp, ok := store.get("a")
+	if !ok || !tmp.IsTemporaryAffinity() {
+		t.Fatalf("snapshot served from the store must report temporary-affinity, ok=%v auth=%+v", ok, tmp)
+	}
+}
+
 // TestFilterExecutionModels_TemporaryAffinityBypassesBlocked verifies that a
 // temporary (in-memory) credential whose frozen snapshot is marked unavailable
 // is still attempted, so residual value can be squeezed out of it.

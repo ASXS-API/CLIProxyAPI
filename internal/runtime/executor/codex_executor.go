@@ -2002,7 +2002,15 @@ func finalizeCodexRequestObject(obj map[string]json.RawMessage, baseModel string
 		delete(obj, "stream")
 	}
 	if removeUnsupported {
-		delete(obj, "previous_response_id")
+		// For in-memory (revoked/removed) credentials we deliberately KEEP
+		// previous_response_id. The session is sticky to the same account that
+		// established the conversation, so preserving the linkage lets the upstream
+		// treat the request as a continuation of an already-established session and
+		// squeeze residual value out of the (possibly revoked) token. Normal rotated
+		// credentials still strip it to avoid previous_response_not_found.
+		if auth == nil || !auth.IsTemporaryAffinity() {
+			delete(obj, "previous_response_id")
+		}
 		delete(obj, "prompt_cache_retention")
 		delete(obj, "safety_identifier")
 		delete(obj, "stream_options")

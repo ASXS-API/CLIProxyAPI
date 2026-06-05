@@ -248,6 +248,13 @@ func (a *Auth) Clone() *Auth {
 	return &copyAuth
 }
 
+// IsTemporaryAffinity reports whether this auth is an in-memory session-affinity
+// snapshot of a removed/revoked credential, served to squeeze residual value out
+// of sessions that were established on it before removal.
+func (a *Auth) IsTemporaryAffinity() bool {
+	return a != nil && a.temporaryAffinity
+}
+
 // copyTransientSelectionState carries in-memory-only selection state (session
 // affinity rebind hint and temporary-affinity attribution) from src onto a.
 // These fields never live in the manager's stored Auth, so they must be
