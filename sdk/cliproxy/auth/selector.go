@@ -462,10 +462,16 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	if cfg.TTL <= 0 {
 		cfg.TTL = time.Hour
 	}
+	// Keep the in-memory credential at least as long as a session binding can
+	// point at it, so a binding never outlives the snapshot it references.
+	temporaryTTL := sessionAffinityTemporaryAuthTTL
+	if cfg.TTL > temporaryTTL {
+		temporaryTTL = cfg.TTL
+	}
 	return &SessionAffinitySelector{
 		fallback:       cfg.Fallback,
 		cache:          NewSessionCache(cfg.TTL),
-		temporaryAuths: newSessionAffinityTemporaryAuthStore(sessionAffinityTemporaryAuthTTL, sessionAffinityTemporaryAuthMaxFailures),
+		temporaryAuths: newSessionAffinityTemporaryAuthStore(temporaryTTL, sessionAffinityTemporaryAuthMaxFailures),
 	}
 }
 
@@ -514,9 +520,20 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 		triedCachedAuth := sessionAffinityTriedAuthID(opts.Metadata, cachedAuthID)
 		if !cachedAuthExistsLocally && !triedCachedAuth {
-			if auth, okTemp := s.temporaryAuths.get(cachedAuthID); okTemp {
-				entry.Infof("session-affinity: local auth unavailable, using temporary memory auth | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-				return auth, nil
+			// Detach this session from the in-memory credential only when it has
+			// exhausted its per-session failure budget AND a live credential is
+			// available to take over. If no live credential exists, keep serving
+			// from the memory snapshot (a degraded credential beats a hard error).
+			sessionDetached := errAvailable == nil && s.temporaryAuths.sessionExceeded(cachedAuthID, cacheKey)
+			if !sessionDetached {
+				if auth, okTemp := s.temporaryAuths.get(cachedAuthID); okTemp {
+					auth.temporaryAffinityCacheKey = cacheKey
+					auth.temporaryAffinitySessionID = primaryID
+					entry.Infof("session-affinity: local auth unavailable, using temporary memory auth | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+					return auth, nil
+				}
+			} else {
+				entry.Infof("session-affinity: temporary memory auth detached for session after repeated failures, reselecting live credential | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, provider, model)
 			}
 		}
 		// Cached auth not available, reselect via fallback selector for even distribution.
@@ -617,6 +634,9 @@ func (s *SessionAffinitySelector) Stop() {
 	if s.cache != nil {
 		s.cache.Stop()
 	}
+	if s.temporaryAuths != nil {
+		s.temporaryAuths.Stop()
+	}
 }
 
 func (s *SessionAffinitySelector) HandleAuthRemoved(auth *Auth) bool {
@@ -634,15 +654,14 @@ func (s *SessionAffinitySelector) RecordTemporaryAuthSuccess(auth *Auth) {
 	s.temporaryAuths.recordSuccess(auth)
 }
 
-func (s *SessionAffinitySelector) RecordTemporaryAuthFailure(auth *Auth, err error) bool {
+func (s *SessionAffinitySelector) RecordTemporaryAuthFailure(auth *Auth, err error, requestID string) bool {
 	if s == nil || s.temporaryAuths == nil {
 		return false
 	}
-	evicted := s.temporaryAuths.recordFailure(auth, err)
-	if evicted && auth != nil && strings.TrimSpace(auth.ID) != "" && s.cache != nil {
-		s.cache.InvalidateAuth(auth.ID)
-	}
-	return evicted
+	// Per-session tracking only: never evict the shared entry and never drop all
+	// session bindings here. A session that exhausts its per-session budget is
+	// detached at Pick time, and only when a live credential is available.
+	return s.temporaryAuths.recordFailure(auth, err, requestID)
 }
 
 func (s *SessionAffinitySelector) RecordFallbackAuthSuccess(auth *Auth) bool {

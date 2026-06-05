@@ -1291,8 +1291,10 @@ func (m *Manager) recordTemporaryAffinityFailure(ctx context.Context, auth *Auth
 		strings.TrimSpace(stage),
 		summarizeTemporaryAuthError(err),
 	)
-	if recorder, ok := m.selector.(interface{ RecordTemporaryAuthFailure(*Auth, error) bool }); ok && recorder != nil {
-		recorder.RecordTemporaryAuthFailure(auth, err)
+	if recorder, ok := m.selector.(interface {
+		RecordTemporaryAuthFailure(*Auth, error, string) bool
+	}); ok && recorder != nil {
+		recorder.RecordTemporaryAuthFailure(auth, err, logging.GetRequestID(ctx))
 	}
 }
 
@@ -1309,7 +1311,9 @@ func selectorSupportsTemporaryAffinity(selector Selector) bool {
 	if selector == nil {
 		return false
 	}
-	_, ok := selector.(interface{ RecordTemporaryAuthFailure(*Auth, error) bool })
+	_, ok := selector.(interface {
+		RecordTemporaryAuthFailure(*Auth, error, string) bool
+	})
 	return ok
 }
 
@@ -1827,10 +1831,10 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 	if m == nil || executor == nil || auth == nil {
 		return auth, nil
 	}
-	rebind := auth.sessionAffinityRebind
+	transientSrc := auth
 	withTransientSelectionState := func(prepared *Auth) *Auth {
-		if prepared != nil && rebind.cacheKey != "" {
-			prepared.sessionAffinityRebind = rebind
+		if prepared != nil {
+			prepared.copyTransientSelectionState(transientSrc)
 		}
 		return prepared
 	}
@@ -3308,12 +3312,12 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	authCopy := selected.Clone()
 	m.mu.RUnlock()
 	if !selected.indexAssigned {
-		rebind := authCopy.sessionAffinityRebind
+		prev := authCopy
 		m.mu.Lock()
 		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
 			current.EnsureIndex()
 			authCopy = current.Clone()
-			authCopy.sessionAffinityRebind = rebind
+			authCopy.copyTransientSelectionState(prev)
 		}
 		m.mu.Unlock()
 	}
@@ -3371,12 +3375,12 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		}
 		authCopy := selected.Clone()
 		if !selected.indexAssigned {
-			rebind := authCopy.sessionAffinityRebind
+			prev := authCopy
 			m.mu.Lock()
 			if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
 				current.EnsureIndex()
 				authCopy = current.Clone()
-				authCopy.sessionAffinityRebind = rebind
+				authCopy.copyTransientSelectionState(prev)
 			}
 			m.mu.Unlock()
 		}
@@ -3502,12 +3506,12 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	authCopy := selected.Clone()
 	m.mu.RUnlock()
 	if !selected.indexAssigned {
-		rebind := authCopy.sessionAffinityRebind
+		prev := authCopy
 		m.mu.Lock()
 		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
 			current.EnsureIndex()
 			authCopy = current.Clone()
-			authCopy.sessionAffinityRebind = rebind
+			authCopy.copyTransientSelectionState(prev)
 		}
 		m.mu.Unlock()
 	}
@@ -3592,12 +3596,12 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		}
 		authCopy := selected.Clone()
 		if !selected.indexAssigned {
-			rebind := authCopy.sessionAffinityRebind
+			prev := authCopy
 			m.mu.Lock()
 			if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
 				current.EnsureIndex()
 				authCopy = current.Clone()
-				authCopy.sessionAffinityRebind = rebind
+				authCopy.copyTransientSelectionState(prev)
 			}
 			m.mu.Unlock()
 		}

@@ -100,6 +100,8 @@ type Auth struct {
 	indexAssigned              bool                  `json:"-"`
 	temporaryAffinity          bool                  `json:"-"`
 	temporaryAffinityDeletedAt time.Time             `json:"-"`
+	temporaryAffinitySessionID string                `json:"-"`
+	temporaryAffinityCacheKey  string                `json:"-"`
 	sessionAffinityRebind      sessionAffinityRebind `json:"-"`
 }
 
@@ -244,6 +246,22 @@ func (a *Auth) Clone() *Auth {
 	}
 	copyAuth.Runtime = a.Runtime
 	return &copyAuth
+}
+
+// copyTransientSelectionState carries in-memory-only selection state (session
+// affinity rebind hint and temporary-affinity attribution) from src onto a.
+// These fields never live in the manager's stored Auth, so they must be
+// re-applied whenever a freshly cloned stored Auth replaces a selector-produced
+// clone (e.g. the index-assignment re-clone and request-auth preparation paths).
+func (a *Auth) copyTransientSelectionState(src *Auth) {
+	if a == nil || src == nil {
+		return
+	}
+	a.sessionAffinityRebind = src.sessionAffinityRebind
+	a.temporaryAffinity = src.temporaryAffinity
+	a.temporaryAffinityDeletedAt = src.temporaryAffinityDeletedAt
+	a.temporaryAffinitySessionID = src.temporaryAffinitySessionID
+	a.temporaryAffinityCacheKey = src.temporaryAffinityCacheKey
 }
 
 func stableAuthIndex(seed string) string {

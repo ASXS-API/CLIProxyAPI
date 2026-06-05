@@ -14,16 +14,29 @@ const (
 	sessionAffinityTemporaryAuthMaxFailures = 5
 )
 
+// sessionFailureState tracks consecutive failures for a single session (cache
+// key) against one temporary in-memory auth. Counting is per session so that a
+// single misbehaving session never affects the credential shared by others.
+type sessionFailureState struct {
+	count         int
+	lastRequestID string
+	lastAt        time.Time
+}
+
 type sessionAffinityTemporaryAuthEntry struct {
-	auth                *Auth
-	expiresAt           time.Time
-	deletedAt           time.Time
-	hitCount            int
-	successCount        int
-	failureCount        int
-	consecutiveFailures int
-	lastSuccessAt       time.Time
-	lastFailureAt       time.Time
+	auth          *Auth
+	expiresAt     time.Time
+	deletedAt     time.Time
+	hitCount      int
+	successCount  int
+	failureCount  int
+	lastSuccessAt time.Time
+	lastFailureAt time.Time
+	// sessionFailures holds per-session consecutive-failure counters keyed by
+	// the session cache key (provider::session::model). It is intentionally NOT
+	// a single global counter: the temporary credential is shared by many sticky
+	// sessions and must outlive any one session's failures.
+	sessionFailures map[string]*sessionFailureState
 }
 
 type sessionAffinityTemporaryAuthStore struct {
@@ -31,6 +44,7 @@ type sessionAffinityTemporaryAuthStore struct {
 	auths    map[string]*sessionAffinityTemporaryAuthEntry
 	ttl      time.Duration
 	maxFails int
+	stopCh   chan struct{}
 }
 
 func newSessionAffinityTemporaryAuthStore(ttl time.Duration, maxFails int) *sessionAffinityTemporaryAuthStore {
@@ -40,11 +54,17 @@ func newSessionAffinityTemporaryAuthStore(ttl time.Duration, maxFails int) *sess
 	if maxFails <= 0 {
 		maxFails = sessionAffinityTemporaryAuthMaxFailures
 	}
-	return &sessionAffinityTemporaryAuthStore{
+	s := &sessionAffinityTemporaryAuthStore{
 		auths:    make(map[string]*sessionAffinityTemporaryAuthEntry),
 		ttl:      ttl,
 		maxFails: maxFails,
+		stopCh:   make(chan struct{}),
 	}
+	// A dedicated sweeper guarantees that a credential abandoned by all sessions
+	// is reclaimed once its TTL elapses, rather than depending on unrelated auth
+	// add/remove/access events to trigger the lazy cleanup.
+	go s.cleanupLoop()
+	return s
 }
 
 func (s *sessionAffinityTemporaryAuthStore) rememberLocal(auth *Auth) {
@@ -63,7 +83,9 @@ func (s *sessionAffinityTemporaryAuthStore) rememberLocal(auth *Auth) {
 	entry.auth = cloneAsLocalAffinityAuth(auth)
 	entry.expiresAt = now.Add(s.ttl)
 	entry.deletedAt = time.Time{}
-	entry.consecutiveFailures = 0
+	// The local credential is healthy again; drop every session's failure streak
+	// recorded against the in-memory snapshot.
+	entry.sessionFailures = nil
 }
 
 func (s *sessionAffinityTemporaryAuthStore) markDeleted(auth *Auth) {
@@ -84,6 +106,8 @@ func (s *sessionAffinityTemporaryAuthStore) markDeleted(auth *Auth) {
 	if entry.deletedAt.IsZero() {
 		entry.deletedAt = now
 	}
+	// Intentionally preserve sessionFailures: an auth that flaps
+	// removed->readded->removed should not lose in-progress per-session state.
 	log.Infof("session-affinity temporary auth: local auth removed, retained in memory | auth=%s deleted_at=%s", temporaryAuthLogName(auth), entry.deletedAt.Format(time.RFC3339))
 }
 
@@ -111,6 +135,24 @@ func (s *sessionAffinityTemporaryAuthStore) get(authID string) (*Auth, bool) {
 	return out, true
 }
 
+// sessionExceeded reports whether the given session (cache key) has reached the
+// per-session consecutive-failure threshold for the temporary auth. The selector
+// uses this to stop routing that session to the in-memory credential (when a live
+// credential is available) without evicting the shared entry.
+func (s *sessionAffinityTemporaryAuthStore) sessionExceeded(authID, cacheKey string) bool {
+	if s == nil || strings.TrimSpace(authID) == "" || strings.TrimSpace(cacheKey) == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry := s.auths[authID]
+	if entry == nil || entry.sessionFailures == nil {
+		return false
+	}
+	state := entry.sessionFailures[cacheKey]
+	return state != nil && state.count >= s.maxFails
+}
+
 func (s *sessionAffinityTemporaryAuthStore) recordSuccess(auth *Auth) {
 	if s == nil || auth == nil || !auth.temporaryAffinity || strings.TrimSpace(auth.ID) == "" {
 		return
@@ -123,20 +165,29 @@ func (s *sessionAffinityTemporaryAuthStore) recordSuccess(auth *Auth) {
 		return
 	}
 	entry.successCount++
-	entry.consecutiveFailures = 0
 	entry.lastSuccessAt = now
 	entry.expiresAt = now.Add(s.ttl)
+	// Reset only this session's streak; other sessions are untouched.
+	if cacheKey := strings.TrimSpace(auth.temporaryAffinityCacheKey); cacheKey != "" && entry.sessionFailures != nil {
+		delete(entry.sessionFailures, cacheKey)
+	}
 	log.Infof(
-		"session-affinity temporary auth: memory auth succeeded after local miss | auth=%s deleted_at=%s hit_count=%d success_count=%d failure_count=%d",
+		"session-affinity temporary auth: memory auth succeeded after local miss | auth=%s deleted_at=%s session=%s hit_count=%d success_count=%d failure_count=%d",
 		temporaryAuthLogName(entry.auth),
 		formatTemporaryAuthTime(entry.deletedAt),
+		truncateSessionID(strings.TrimSpace(auth.temporaryAffinitySessionID)),
 		entry.hitCount,
 		entry.successCount,
 		entry.failureCount,
 	)
 }
 
-func (s *sessionAffinityTemporaryAuthStore) recordFailure(auth *Auth, err error) bool {
+// recordFailure attributes a failure to the session that produced it. It never
+// evicts the shared entry and never mutates the session cache; it only tracks the
+// per-session streak. It returns whether that session has now reached the
+// per-session threshold. requestID is used to count at most once per client
+// request, since the executor may retry several upstream models per request.
+func (s *sessionAffinityTemporaryAuthStore) recordFailure(auth *Auth, err error, requestID string) bool {
 	if s == nil || auth == nil || !auth.temporaryAffinity || strings.TrimSpace(auth.ID) == "" {
 		return false
 	}
@@ -148,23 +199,47 @@ func (s *sessionAffinityTemporaryAuthStore) recordFailure(auth *Auth, err error)
 		return false
 	}
 	entry.failureCount++
-	entry.consecutiveFailures++
 	entry.lastFailureAt = now
 	entry.expiresAt = now.Add(s.ttl)
-	log.Warnf(
-		"session-affinity temporary auth: memory auth failed after local miss | auth=%s deleted_at=%s hit_count=%d consecutive_failures=%d failure_count=%d error=%s",
-		temporaryAuthLogName(entry.auth),
-		formatTemporaryAuthTime(entry.deletedAt),
-		entry.hitCount,
-		entry.consecutiveFailures,
-		entry.failureCount,
-		summarizeTemporaryAuthError(err),
-	)
-	if entry.consecutiveFailures < s.maxFails {
+	cacheKey := strings.TrimSpace(auth.temporaryAffinityCacheKey)
+	if cacheKey == "" {
+		// Attribution missing: count the aggregate failure but never detach a
+		// session. Defensive only; should not happen once the clone chain
+		// preserves the cache key end-to-end.
+		log.Warnf(
+			"session-affinity temporary auth: memory auth failed without session attribution | auth=%s deleted_at=%s failure_count=%d error=%s",
+			temporaryAuthLogName(entry.auth),
+			formatTemporaryAuthTime(entry.deletedAt),
+			entry.failureCount,
+			summarizeTemporaryAuthError(err),
+		)
 		return false
 	}
-	s.deleteLocked(auth.ID, entry, "consecutive_failures")
-	return true
+	if entry.sessionFailures == nil {
+		entry.sessionFailures = make(map[string]*sessionFailureState)
+	}
+	state := entry.sessionFailures[cacheKey]
+	if state == nil {
+		state = &sessionFailureState{}
+		entry.sessionFailures[cacheKey] = state
+	}
+	state.lastAt = now
+	if requestID == "" || state.lastRequestID != requestID {
+		state.count++
+		state.lastRequestID = requestID
+	}
+	exceeded := state.count >= s.maxFails
+	log.Warnf(
+		"session-affinity temporary auth: memory auth failed after local miss | auth=%s deleted_at=%s session=%s session_failures=%d failure_count=%d exceeded=%t error=%s",
+		temporaryAuthLogName(entry.auth),
+		formatTemporaryAuthTime(entry.deletedAt),
+		truncateSessionID(strings.TrimSpace(auth.temporaryAffinitySessionID)),
+		state.count,
+		entry.failureCount,
+		exceeded,
+		summarizeTemporaryAuthError(err),
+	)
+	return exceeded
 }
 
 func (s *sessionAffinityTemporaryAuthStore) delete(authID string, reason string) {
@@ -198,7 +273,55 @@ func (s *sessionAffinityTemporaryAuthStore) cleanupExpiredLocked(now time.Time) 
 	for authID, entry := range s.auths {
 		if entry == nil || now.After(entry.expiresAt) {
 			s.deleteLocked(authID, entry, "ttl_expired")
+			continue
 		}
+		s.pruneSessionFailuresLocked(entry, now)
+	}
+}
+
+// pruneSessionFailuresLocked drops per-session counters for sessions that have
+// not failed within a TTL window, bounding the map for long-lived entries that
+// are kept alive by a healthy session.
+func (s *sessionAffinityTemporaryAuthStore) pruneSessionFailuresLocked(entry *sessionAffinityTemporaryAuthEntry, now time.Time) {
+	if entry == nil || len(entry.sessionFailures) == 0 {
+		return
+	}
+	for key, state := range entry.sessionFailures {
+		if state == nil || now.Sub(state.lastAt) > s.ttl {
+			delete(entry.sessionFailures, key)
+		}
+	}
+}
+
+func (s *sessionAffinityTemporaryAuthStore) cleanupLoop() {
+	interval := s.ttl / 2
+	if interval <= 0 {
+		interval = sessionAffinityTemporaryAuthTTL / 2
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+			now := time.Now()
+			s.mu.Lock()
+			s.cleanupExpiredLocked(now)
+			s.mu.Unlock()
+		}
+	}
+}
+
+// Stop terminates the background sweeper goroutine.
+func (s *sessionAffinityTemporaryAuthStore) Stop() {
+	if s == nil {
+		return
+	}
+	select {
+	case <-s.stopCh:
+	default:
+		close(s.stopCh)
 	}
 }
 
@@ -209,6 +332,8 @@ func cloneAsLocalAffinityAuth(auth *Auth) *Auth {
 	out := auth.Clone()
 	out.temporaryAffinity = false
 	out.temporaryAffinityDeletedAt = time.Time{}
+	out.temporaryAffinitySessionID = ""
+	out.temporaryAffinityCacheKey = ""
 	return out
 }
 
