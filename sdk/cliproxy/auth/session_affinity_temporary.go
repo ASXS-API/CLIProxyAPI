@@ -12,6 +12,15 @@ import (
 const (
 	sessionAffinityTemporaryAuthTTL         = 60 * time.Minute
 	sessionAffinityTemporaryAuthMaxFailures = 5
+	// sessionAffinityTemporaryAuthCleanupSweepInterval throttles the inline
+	// expiry/prune sweep invoked from the hot per-request paths
+	// (rememberLocal/markDeleted/get). The sweep is O(num_auths × sessions_per_auth)
+	// and was previously run on every resolved request, dominating CPU under load.
+	// The dedicated cleanupLoop goroutine (every ttl/2) provides the eventual-
+	// reclamation guarantee, and pruneSessionFailuresLocked only drops counters
+	// older than ttl, so bounding the inline sweep to this interval is behaviorally
+	// invisible while collapsing thousands of redundant sweeps/sec into ~one.
+	sessionAffinityTemporaryAuthCleanupSweepInterval = 30 * time.Second
 )
 
 // sessionFailureState tracks consecutive failures for a single session (cache
@@ -40,11 +49,12 @@ type sessionAffinityTemporaryAuthEntry struct {
 }
 
 type sessionAffinityTemporaryAuthStore struct {
-	mu       sync.Mutex
-	auths    map[string]*sessionAffinityTemporaryAuthEntry
-	ttl      time.Duration
-	maxFails int
-	stopCh   chan struct{}
+	mu          sync.Mutex
+	auths       map[string]*sessionAffinityTemporaryAuthEntry
+	ttl         time.Duration
+	maxFails    int
+	stopCh      chan struct{}
+	lastCleanup time.Time
 }
 
 func newSessionAffinityTemporaryAuthStore(ttl time.Duration, maxFails int) *sessionAffinityTemporaryAuthStore {
@@ -270,6 +280,16 @@ func (s *sessionAffinityTemporaryAuthStore) deleteLocked(authID string, entry *s
 }
 
 func (s *sessionAffinityTemporaryAuthStore) cleanupExpiredLocked(now time.Time) {
+	// Throttle: this sweep is invoked from hot per-request paths but is pure
+	// non-urgent housekeeping (TTL eviction is also enforced lazily by get(), and
+	// the cleanupLoop goroutine guarantees reclamation every ttl/2). Skipping it
+	// when a sweep ran within the last interval removes the per-request
+	// O(num_auths × sessions_per_auth) cost. Callers hold s.mu, so lastCleanup is
+	// accessed under the lock. A zero lastCleanup (first call) always sweeps.
+	if !s.lastCleanup.IsZero() && now.Sub(s.lastCleanup) < sessionAffinityTemporaryAuthCleanupSweepInterval {
+		return
+	}
+	s.lastCleanup = now
 	for authID, entry := range s.auths {
 		if entry == nil || now.After(entry.expiresAt) {
 			s.deleteLocked(authID, entry, "ttl_expired")
