@@ -43,6 +43,51 @@ func newUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
 	}
 }
 
+const (
+	// utlsConnReadIdleTimeout / utlsConnPingTimeout health-check pooled HTTP/2
+	// connections. Because a utlsRoundTripper is now shared and long-lived,
+	// connections sit idle between requests; without active PINGs a connection
+	// the upstream (or the egress proxy) dropped silently would keep reporting
+	// CanTakeNewRequest()==true and fail the next request routed onto it.
+	utlsConnReadIdleTimeout = 30 * time.Second
+	utlsConnPingTimeout     = 15 * time.Second
+)
+
+// utlsRoundTripperRegistry pools one shared *utlsRoundTripper per resolved proxy
+// URL. Previously NewUtlsHTTPClient built a fresh round tripper — and therefore
+// a fresh, empty HTTP/2 connection pool — on every request, so every Codex/Claude
+// upstream call opened a brand-new TCP+uTLS connection and never reused a
+// kept-alive one. That outbound connect() + uTLS handshake was the dominant CPU
+// cost under load (live profiling showed connect() alone at ~32% of CPU with
+// extreme connection turnover). Sharing the round tripper lets its per-host
+// HTTP/2 connection map actually be reused across requests.
+//
+// Keying by proxyURL is safe for per-credential sticky egress: the credential's
+// egress identity is fully encoded in the proxy URL (see EffectiveProxyURL /
+// credentialEgressProxyURL, which inject the credential's stable index as the
+// proxy username), so two requests sharing a proxyURL share the same egress IP,
+// and the pooled per-host connection stays sticky to that egress. The number of
+// distinct proxy URLs is bounded by the credential count.
+type utlsRoundTripperRegistry struct {
+	mu      sync.Mutex
+	entries map[string]*utlsRoundTripper
+}
+
+var globalUtlsRoundTrippers = &utlsRoundTripperRegistry{
+	entries: make(map[string]*utlsRoundTripper),
+}
+
+func (r *utlsRoundTripperRegistry) get(proxyURL string) *utlsRoundTripper {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rt, ok := r.entries[proxyURL]
+	if !ok {
+		rt = newUtlsRoundTripper(proxyURL)
+		r.entries[proxyURL] = rt
+	}
+	return rt
+}
+
 func (t *utlsRoundTripper) getOrCreateConnection(host, addr string) (*http2.ClientConn, error) {
 	t.mu.Lock()
 
@@ -93,7 +138,10 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 		return nil, err
 	}
 
-	tr := &http2.Transport{}
+	tr := &http2.Transport{
+		ReadIdleTimeout: utlsConnReadIdleTimeout,
+		PingTimeout:     utlsConnPingTimeout,
+	}
 	h2Conn, err := tr.NewClientConn(tlsConn)
 	if err != nil {
 		tlsConn.Close()
@@ -163,15 +211,19 @@ func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyau
 		ctxRoundTripper, _ = ctx.Value("cliproxy.roundtripper").(http.RoundTripper)
 	}
 
-	var utlsRT http.RoundTripper = newUtlsRoundTripper(proxyURL)
+	var utlsRT http.RoundTripper
 	var standardTransport http.RoundTripper = http.DefaultTransport
-	if proxyURL != "" {
+	switch {
+	case proxyURL != "":
+		utlsRT = globalUtlsRoundTrippers.get(proxyURL)
 		if transport := buildProxyTransport(proxyURL); transport != nil {
 			standardTransport = transport
 		}
-	} else if ctxRoundTripper != nil {
+	case ctxRoundTripper != nil:
 		utlsRT = ctxRoundTripper
 		standardTransport = ctxRoundTripper
+	default:
+		utlsRT = globalUtlsRoundTrippers.get(proxyURL)
 	}
 
 	client := &http.Client{
