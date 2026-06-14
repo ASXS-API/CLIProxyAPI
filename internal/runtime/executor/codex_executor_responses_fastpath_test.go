@@ -122,6 +122,88 @@ func TestPrepareCodexResponsesRequestBodyFastReasoningMatchesFallback(t *testing
 	assertJSONEqual(t, fallbackBody, fastBody)
 }
 
+func TestPrepareCodexResponsesRequestBodyFastThinkingSuffixMatchesFallback(t *testing.T) {
+	// A model thinking suffix (e.g. "gpt-5.4-mini(high)") must now take the single-parse
+	// fast path (it previously fell back to the byte path). The suffix-derived reasoning
+	// effort must be applied on the fast path identically to the full translate +
+	// ApplyThinking + ApplyPayloadConfig + finalize slow path — including when the body
+	// carries NO "reasoning" object (the case the old reasoning-only trigger missed).
+	cases := []struct {
+		name    string
+		model   string
+		rawJSON string
+	}{
+		{
+			name:  "suffix without body reasoning",
+			model: "gpt-5.4-mini(high)",
+			rawJSON: `{
+				"model":"gpt-5.4-mini",
+				"instructions":null,
+				"input":[
+					{"type":"message","role":"system","content":[{"type":"input_text","text":"system"}]},
+					{"type":"message","role":"user","content":[{"type":"input_text","text":"hello <world>"}]}
+				],
+				"tools":[{"type":"web_search_preview"}],
+				"max_output_tokens":1024,
+				"previous_response_id":"resp_old",
+				"stream_options":{"include_usage":true},
+				"user":"abc"
+			}`,
+		},
+		{
+			name:  "suffix overrides body reasoning",
+			model: "gpt-5.4-mini(low)",
+			rawJSON: `{
+				"model":"gpt-5.4-mini",
+				"instructions":null,
+				"input":[
+					{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}
+				],
+				"reasoning":{"effort":"high"},
+				"tools":[{"type":"web_search_preview"}],
+				"user":"abc"
+			}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rawJSON := []byte(tc.rawJSON)
+			exec := NewCodexExecutor(&config.Config{})
+			req := cliproxyexecutor.Request{Model: tc.model, Payload: rawJSON}
+			opts := cliproxyexecutor.Options{
+				SourceFormat:    sdktranslator.FromString("openai-response"),
+				OriginalRequest: rawJSON,
+				Stream:          true,
+			}
+			from := opts.SourceFormat
+			to := sdktranslator.FromString("codex")
+			baseModel := thinking.ParseSuffix(req.Model).ModelName
+
+			originalPayload, fastBody, ok, err := exec.prepareCodexResponsesRequestBodyFast(context.Background(), nil, req, opts, from, to, baseModel, codexStreamKeep, true, true)
+			if err != nil {
+				t.Fatalf("prepareCodexResponsesRequestBodyFast error: %v", err)
+			}
+			if !ok {
+				t.Fatal("prepareCodexResponsesRequestBodyFast did not use fast path for thinking suffix request")
+			}
+			if !sameBytesBacking(originalPayload, rawJSON) {
+				t.Fatal("fast path did not preserve original payload backing")
+			}
+
+			originalTranslated, fallbackBody := translateCodexRequestPair(opts, from, to, baseModel, originalPayload, req.Payload, true)
+			fallbackBody, err = thinking.ApplyThinking(fallbackBody, req.Model, from.String(), to.String(), exec.Identifier())
+			if err != nil {
+				t.Fatalf("ApplyThinking error: %v", err)
+			}
+			fallbackBody = helps.ApplyPayloadConfigWithRoot(exec.cfg, baseModel, to.String(), "", fallbackBody, originalTranslated, req.Model, "")
+			fallbackBody = finalizeCodexRequestBody(fallbackBody, baseModel, codexStreamKeep, true, true, nil, "")
+
+			assertJSONEqual(t, fallbackBody, fastBody)
+		})
+	}
+}
+
 func TestPrepareCodexResponsesRequestBodyFastFallsBackForByteMutators(t *testing.T) {
 	rawJSON := []byte(`{"model":"gpt-5.4-mini","input":"hello"}`)
 	req := cliproxyexecutor.Request{Model: "gpt-5.4-mini", Payload: rawJSON}
@@ -139,12 +221,6 @@ func TestPrepareCodexResponsesRequestBodyFastFallsBackForByteMutators(t *testing
 		req  cliproxyexecutor.Request
 		opts cliproxyexecutor.Options
 	}{
-		{
-			name: "thinking suffix",
-			exec: NewCodexExecutor(&config.Config{}),
-			req:  cliproxyexecutor.Request{Model: "gpt-5.4-mini(high)", Payload: rawJSON},
-			opts: opts,
-		},
 		{
 			name: "payload rules",
 			exec: NewCodexExecutor(&config.Config{Payload: config.PayloadConfig{

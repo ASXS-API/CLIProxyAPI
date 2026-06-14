@@ -212,20 +212,27 @@ func (e *CodexExecutor) prepareCodexResponsesRequestBodyFast(ctx context.Context
 	if !parsed {
 		return originalPayload, nil, false, nil
 	}
-	// Previously, a request carrying a "reasoning" object bailed to the byte-based slow
-	// path solely so thinking.ApplyThinking could run. For reasoning models (gpt-5/codex)
-	// that is almost every request, and the fallback re-translated + re-finalized the whole
+	// Previously, a request carrying a "reasoning" object OR a model thinking suffix
+	// (e.g. "gpt-5-codex(high)") bailed to the byte-based slow path solely so
+	// thinking.ApplyThinking could run. For reasoning models (gpt-5/codex) that is
+	// almost every request, and the fallback re-translated + re-finalized the whole
 	// body (several extra full JSON unmarshal/marshal passes — the dominant CPU cost under load).
 	//
 	// Instead, stay on the single-parse object path and apply thinking on the marshaled result.
 	// This is semantically equivalent here because:
 	//   - finalizeCodexRequestObject never touches "reasoning" and ApplyThinking only adjusts
 	//     "reasoning.effort", so they act on disjoint fields and their order does not matter;
-	//   - ApplyThinking takes the model from req.Model (not the body), so finalize setting
-	//     obj["model"] beforehand has no effect on it;
+	//   - ApplyThinking takes the model (and thus the suffix) from req.Model (not the body), so
+	//     finalize setting obj["model"] beforehand has no effect on it, and a suffix-derived
+	//     effort is applied identically whether the body originally carried "reasoning" or not;
+	//   - ApplyThinkingTrusted is byte-identical to ApplyThinking on a valid body (the body was
+	//     just marshaled here), so trusting it only skips a redundant whole-body validation;
 	//   - the fast path is only eligible when no payload-config rules apply, so the slow path's
 	//     ApplyPayloadConfig step is a no-op and can be skipped.
-	needsThinking := codexResponsesRequestObjectNeedsThinkingBytePath(obj)
+	// Trigger thinking when EITHER the body carries a reasoning object (body config) OR the
+	// model carries a thinking suffix (suffix config) — mirroring the slow path's unconditional
+	// ApplyThinking, which is a no-op only when neither source is present.
+	needsThinking := codexResponsesRequestObjectNeedsThinkingBytePath(obj) || thinking.ParseSuffix(req.Model).HasSuffix
 
 	// Do NOT set prompt_cache_key here: cacheHelper sets it after the reasoning-replay
 	// cache runs. Setting a derived prompt_cache_key before applyCodexReasoningReplayCache
@@ -267,9 +274,12 @@ func codexResponsesRequestObjectFastPathEligible(cfg *config.Config, from, to sd
 	if !sameBytesBacking(originalPayload, req.Payload) {
 		return false
 	}
-	if thinking.ParseSuffix(req.Model).HasSuffix {
-		return false
-	}
+	// A model thinking suffix (e.g. "gpt-5-codex(high)") used to bail to the byte
+	// slow path so thinking.ApplyThinking could derive reasoning.effort from the
+	// suffix. That covers ~all production codex traffic, so the whole fleet ran the
+	// 3-4x full-body JSON round-trip slow path. The suffix is now handled on the
+	// single-parse object path (see prepareCodexResponsesRequestBodyFast), so it no
+	// longer disqualifies the fast path.
 	return !codexResponsesPayloadConfigNeedsBytePath(cfg)
 }
 
