@@ -164,6 +164,22 @@ func TestPrepareCodexResponsesRequestBodyFastThinkingSuffixMatchesFallback(t *te
 				"user":"abc"
 			}`,
 		},
+		{
+			// The suffix overrides reasoning.effort while non-effort reasoning fields
+			// (e.g. summary) must be preserved through the object-level thinking apply.
+			name:  "suffix overrides effort but preserves other reasoning fields",
+			model: "gpt-5.4-mini(low)",
+			rawJSON: `{
+				"model":"gpt-5.4-mini",
+				"instructions":null,
+				"input":[
+					{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}
+				],
+				"reasoning":{"effort":"high","summary":"auto"},
+				"tools":[{"type":"web_search_preview"}],
+				"user":"abc"
+			}`,
+		},
 	}
 
 	for _, tc := range cases {

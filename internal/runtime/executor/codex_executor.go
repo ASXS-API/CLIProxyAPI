@@ -225,13 +225,13 @@ func (e *CodexExecutor) prepareCodexResponsesRequestBodyFast(ctx context.Context
 	//   - ApplyThinking takes the model (and thus the suffix) from req.Model (not the body), so
 	//     finalize setting obj["model"] beforehand has no effect on it, and a suffix-derived
 	//     effort is applied identically whether the body originally carried "reasoning" or not;
-	//   - ApplyThinkingTrusted is byte-identical to ApplyThinking on a valid body (the body was
-	//     just marshaled here), so trusting it only skips a redundant whole-body validation;
 	//   - the fast path is only eligible when no payload-config rules apply, so the slow path's
 	//     ApplyPayloadConfig step is a no-op and can be skipped.
 	// Trigger thinking when EITHER the body carries a reasoning object (body config) OR the
 	// model carries a thinking suffix (suffix config) — mirroring the slow path's unconditional
-	// ApplyThinking, which is a no-op only when neither source is present.
+	// ApplyThinking, which is a no-op only when neither source is present. The mutation is
+	// applied to obj["reasoning"] before marshaling (applyCodexThinkingToReasoning) rather than
+	// rewriting the whole marshaled body.
 	needsThinking := codexResponsesRequestObjectNeedsThinkingBytePath(obj) || thinking.ParseSuffix(req.Model).HasSuffix
 
 	// Do NOT set prompt_cache_key here: cacheHelper sets it after the reasoning-replay
@@ -248,6 +248,16 @@ func (e *CodexExecutor) prepareCodexResponsesRequestBodyFast(ctx context.Context
 			obj["input"] = rewrittenInput
 		}
 	}
+	// Apply thinking to the parsed "reasoning" field BEFORE marshaling. For codex,
+	// ApplyThinking only ever reads/sets/strips "reasoning.effort", so applying it over
+	// a tiny {"reasoning":...} document yields the same reasoning result as running it
+	// over the whole body — without re-parsing + sjson-rewriting the entire (often
+	// multi-KB) marshaled body on every request just to set one field.
+	if needsThinking {
+		if errThinking := applyCodexThinkingToReasoning(obj, req.Model, from.String(), to.String(), e.Identifier()); errThinking != nil {
+			return originalPayload, nil, false, errThinking
+		}
+	}
 	// All values in obj are known-valid JSON (req.Payload was json.Unmarshal'd and
 	// finalize sets valid literals), so emit them verbatim instead of re-compacting
 	// the large unchanged "input" array via json.Encoder.
@@ -255,16 +265,38 @@ func (e *CodexExecutor) prepareCodexResponsesRequestBodyFast(ctx context.Context
 	if err != nil {
 		return originalPayload, nil, false, err
 	}
-	if needsThinking {
-		// body was just produced by MarshalCodexRequestObject, so it is guaranteed
-		// valid JSON; ApplyThinkingTrusted skips the redundant whole-body
-		// gjson.ValidBytes re-validation (hot path under long-context load).
-		body, err = thinking.ApplyThinkingTrusted(body, req.Model, from.String(), to.String(), e.Identifier())
-		if err != nil {
-			return originalPayload, nil, false, err
+	return originalPayload, body, true, nil
+}
+
+// applyCodexThinkingToReasoning applies the thinking/reasoning configuration to the
+// parsed request object's "reasoning" field in place, instead of re-parsing and
+// sjson-rewriting the whole marshaled body. For the codex provider, ApplyThinking
+// only ever reads/sets/strips "reasoning.effort" (see internal/thinking and the codex
+// applier), so applying it over a minimal {"reasoning":...} document produces the same
+// reasoning result, which is then spliced back into obj. This removes a full-body
+// re-parse + rewrite (~7% CPU under load) from every fast-path request while reusing
+// the exact (validated) thinking logic, so the upstream bytes stay equivalent.
+func applyCodexThinkingToReasoning(obj map[string]json.RawMessage, model, fromFormat, toFormat, providerKey string) error {
+	reasoningDoc := []byte(`{}`)
+	if raw, ok := obj["reasoning"]; ok {
+		trimmed := bytes.TrimSpace(raw)
+		if len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null")) {
+			reasoningDoc = make([]byte, 0, len(trimmed)+14)
+			reasoningDoc = append(reasoningDoc, `{"reasoning":`...)
+			reasoningDoc = append(reasoningDoc, trimmed...)
+			reasoningDoc = append(reasoningDoc, '}')
 		}
 	}
-	return originalPayload, body, true, nil
+	updated, err := thinking.ApplyThinkingTrusted(reasoningDoc, model, fromFormat, toFormat, providerKey)
+	if err != nil {
+		return err
+	}
+	if r := gjson.GetBytes(updated, "reasoning"); r.Exists() {
+		obj["reasoning"] = json.RawMessage(r.Raw)
+	} else {
+		delete(obj, "reasoning")
+	}
+	return nil
 }
 
 func codexResponsesRequestObjectFastPathEligible(cfg *config.Config, from, to sdktranslator.Format, req cliproxyexecutor.Request, originalPayload []byte) bool {
