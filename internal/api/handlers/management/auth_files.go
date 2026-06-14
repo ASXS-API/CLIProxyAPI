@@ -770,7 +770,12 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 					return
 				}
 				deleted++
-				h.removeAuth(ctx, full)
+				if h.authManager != nil {
+					if rid := h.authIDForPath(full); rid != "" {
+						h.authManager.MarkAuthRemoved(rid)
+					}
+				}
+				go func(p string) { h.removeAuth(context.Background(), p) }(full)
 			}
 		}
 		c.JSON(200, gin.H{"status": "ok", "deleted": deleted})
@@ -975,11 +980,29 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 	if errDeleteRecord := h.deleteTokenRecord(ctx, targetPath); errDeleteRecord != nil {
 		return filepath.Base(name), http.StatusInternalServerError, errDeleteRecord
 	}
-	if targetID != "" {
-		h.removeAuth(ctx, targetID)
-	} else {
-		h.removeAuth(ctx, targetPath)
+	// Tombstone the auth synchronously so the pick paths stop selecting it
+	// immediately, then run the runtime removal asynchronously. Manager.Remove
+	// takes the write-locked manager/scheduler locks that the per-request pick
+	// path contends; under live traffic the inline call was starved and the
+	// DELETE request timed out (credentials could not be deleted unless all
+	// traffic was stopped). The async removal still completes; the tombstone
+	// makes the credential stop being used at once. Use a background context so
+	// the removal is not cancelled when the HTTP request returns.
+	removalID := targetID
+	if removalID == "" {
+		removalID = h.authIDForPath(targetPath)
 	}
+	if h.authManager != nil && removalID != "" {
+		h.authManager.MarkAuthRemoved(removalID)
+	}
+	go func(id, path string) {
+		bgCtx := context.Background()
+		if id != "" {
+			h.removeAuth(bgCtx, id)
+		} else {
+			h.removeAuth(bgCtx, path)
+		}
+	}(targetID, targetPath)
 	return filepath.Base(name), http.StatusOK, nil
 }
 

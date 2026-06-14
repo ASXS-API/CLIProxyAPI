@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -169,7 +170,19 @@ func TestDeleteAuthFile_RemovesRuntimeAuth(t *testing.T) {
 	if deleteRec.Code != http.StatusOK {
 		t.Fatalf("expected delete status %d, got %d with body %s", http.StatusOK, deleteRec.Code, deleteRec.Body.String())
 	}
-	if _, ok := manager.GetByID(record.ID); ok {
+	// Removal now runs asynchronously so DELETE stays fast even when the
+	// auth-selection locks are saturated by live traffic. The auth is tombstoned
+	// synchronously (stops being selected immediately) and the runtime entry is
+	// reaped shortly after; poll for the eventual removal.
+	removed := false
+	for i := 0; i < 200; i++ {
+		if _, ok := manager.GetByID(record.ID); !ok {
+			removed = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !removed {
 		t.Fatalf("expected runtime auth %q to be removed", record.ID)
 	}
 }

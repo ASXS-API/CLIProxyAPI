@@ -192,6 +192,15 @@ type Manager struct {
 	refreshLoop   *authAutoRefreshLoop
 
 	requestPrepareLocks sync.Map
+
+	// removedAuths records auth IDs deleted via the management API whose full
+	// (write-locked) removal from m.auths / scheduler / session-affinity may still
+	// be in progress. The pick paths consult this lock-free set and skip such auths
+	// immediately, so a credential stops being selected the instant it is deleted —
+	// even under heavy request traffic that would otherwise starve the write-locked
+	// Remove and make DELETE /auth-files time out. Cleared on (re-)registration of
+	// the same ID so a legitimate re-add is honored.
+	removedAuths sync.Map // map[string]struct{}
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -1161,6 +1170,9 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.mu.Lock()
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
+	// A (re-)registered auth is live again: drop any removal tombstone so the
+	// pick paths stop skipping it.
+	m.clearAuthRemoved(auth.ID)
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(authClone)
@@ -1198,6 +1210,8 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
+	// An updated auth is live: drop any removal tombstone.
+	m.clearAuthRemoved(auth.ID)
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(authClone)
@@ -1218,6 +1232,10 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 	if id == "" {
 		return
 	}
+	// Tombstone first (lock-free) so the pick paths stop selecting this auth
+	// immediately, even before the write-locked cleanup below acquires m.mu /
+	// the scheduler lock (which are contended by the per-request pick path).
+	m.removedAuths.Store(id, struct{}{})
 	_ = ctx
 
 	m.mu.Lock()
@@ -1259,6 +1277,43 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 			}
 		}
 	}
+}
+
+// MarkAuthRemoved records an auth ID as removed so the pick paths skip it
+// immediately (lock-free), without waiting for the write-locked Remove cleanup.
+// Callers (e.g. the management DELETE handler) use this to make deletion take
+// effect instantly under live traffic, then run the heavier Remove asynchronously.
+func (m *Manager) MarkAuthRemoved(id string) {
+	if m == nil {
+		return
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return
+	}
+	m.removedAuths.Store(id, struct{}{})
+}
+
+// clearAuthRemoved drops the removed tombstone for an auth ID; called when the
+// same ID is (re-)registered so a legitimate re-add is selectable again.
+func (m *Manager) clearAuthRemoved(id string) {
+	if m == nil {
+		return
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return
+	}
+	m.removedAuths.Delete(id)
+}
+
+// isAuthRemoved reports whether an auth ID has been tombstoned for removal.
+func (m *Manager) isAuthRemoved(id string) bool {
+	if m == nil || id == "" {
+		return false
+	}
+	_, ok := m.removedAuths.Load(id)
+	return ok
 }
 
 func (m *Manager) invalidateSessionAffinity(authID string) {
@@ -3270,6 +3325,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
 			continue
 		}
+		if m.isAuthRemoved(candidate.ID) {
+			continue
+		}
 		localAuthIDs[candidate.ID] = struct{}{}
 		if candidate.Disabled {
 			continue
@@ -3379,6 +3437,13 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		if selected == nil {
 			return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 		}
+		if m.isAuthRemoved(selected.ID) {
+			if tried == nil {
+				tried = make(map[string]struct{})
+			}
+			tried[selected.ID] = struct{}{}
+			continue
+		}
 		if disallowFreeAuth && isFreeCodexAuth(selected) {
 			if tried == nil {
 				tried = make(map[string]struct{})
@@ -3435,6 +3500,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	registryRef := registry.GetGlobalRegistry()
 	for _, candidate := range m.auths {
 		if candidate == nil {
+			continue
+		}
+		if m.isAuthRemoved(candidate.ID) {
 			continue
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
@@ -3595,6 +3663,13 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		}
 		if selected == nil {
 			return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+		}
+		if m.isAuthRemoved(selected.ID) {
+			if tried == nil {
+				tried = make(map[string]struct{})
+			}
+			tried[selected.ID] = struct{}{}
+			continue
 		}
 		if disallowFreeAuth && isFreeCodexAuth(selected) {
 			if tried == nil {
