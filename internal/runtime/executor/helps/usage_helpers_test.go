@@ -286,6 +286,29 @@ func TestUsageReporterSetTranslatedReasoningEffortDefaultsServiceTierWhenRemoved
 	}
 }
 
+func TestExtractServiceTierFromPayloadPriorityAndNested(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		want    string
+	}{
+		{"top level wins over nested", `{"service_tier":"a","request":{"service_tier":"b"},"response":{"service_tier":"c"}}`, "a"},
+		{"request wins over response", `{"request":{"service_tier":"b"},"response":{"service_tier":"c"}}`, "b"},
+		{"response only", `{"response":{"service_tier":"c"}}`, "c"},
+		{"whitespace trimmed", `{"service_tier":"  priority  "}`, "priority"},
+		{"empty top-level falls through to nested", `{"service_tier":"","request":{"service_tier":"b"}}`, "b"},
+		{"absent with large input defaults", `{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":"hi"}]}`, usage.DefaultServiceTier},
+		{"empty payload defaults", ``, usage.DefaultServiceTier},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := extractServiceTierFromPayload([]byte(tc.payload)); got != tc.want {
+				t.Fatalf("extractServiceTierFromPayload(%s) = %q, want %q", tc.payload, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestUsageReporterBuildAdditionalModelRecordSkipsZeroTokens(t *testing.T) {
 	reporter := &UsageReporter{
 		provider:    "codex",

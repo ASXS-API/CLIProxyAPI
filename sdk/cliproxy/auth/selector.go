@@ -709,9 +709,13 @@ func ExtractSessionID(headers http.Header, payload []byte, metadata map[string]a
 // primaryID: full hash including assistant response (stable after first turn)
 // fallbackID: short hash without assistant (used to inherit binding from first turn)
 func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]any) (string, string) {
+	// metadata.user_id is consulted twice below (the Claude Code session format
+	// here, and the non-Claude fallback further down); read it once to avoid a
+	// second full-body gjson scan of the request payload.
+	var userID string
 	// 1. metadata.user_id with Claude Code session format (highest priority)
 	if len(payload) > 0 {
-		userID := gjson.GetBytes(payload, "metadata.user_id").String()
+		userID = gjson.GetBytes(payload, "metadata.user_id").String()
 		if userID != "" {
 			// Old format: user_{hash}_account__session_{uuid}
 			if matches := sessionPattern.FindStringSubmatch(userID); len(matches) >= 2 {
@@ -763,8 +767,9 @@ func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]
 		return "", ""
 	}
 
-	// 6. metadata.user_id (non-Claude Code format)
-	userID := gjson.GetBytes(payload, "metadata.user_id").String()
+	// 6. metadata.user_id (non-Claude Code format) — reuse the value read above
+	// (payload is non-empty here, guaranteed by the len==0 guard) instead of
+	// re-scanning the whole body a second time.
 	if userID != "" {
 		return "user:" + userID, ""
 	}

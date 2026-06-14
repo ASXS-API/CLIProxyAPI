@@ -998,6 +998,19 @@ func TestExtractSessionID_GeminiFormat(t *testing.T) {
 	}
 }
 
+func TestExtractSessionID_MetadataUserIDFallback(t *testing.T) {
+	t.Parallel()
+
+	// A non-Claude-Code metadata.user_id falls through the header checks and
+	// yields a "user:" session id. Guards the dedupe that reads metadata.user_id
+	// once (for the Claude-format check) and reuses it for this fallback instead
+	// of scanning the body a second time.
+	payload := []byte(`{"metadata":{"user_id":"acct-123"},"model":"gpt-5.4"}`)
+	if got := ExtractSessionID(nil, payload, nil); got != "user:acct-123" {
+		t.Fatalf("ExtractSessionID() = %q, want %q", got, "user:acct-123")
+	}
+}
+
 func TestExtractSessionID_OpenAIResponsesAPI(t *testing.T) {
 	t.Parallel()
 

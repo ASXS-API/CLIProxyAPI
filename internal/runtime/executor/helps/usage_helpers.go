@@ -296,11 +296,32 @@ func extractServiceTierFromPayload(payload []byte) string {
 	if len(payload) == 0 {
 		return usage.DefaultServiceTier
 	}
-	for _, path := range []string{"service_tier", "request.service_tier", "response.service_tier"} {
-		serviceTier := strings.TrimSpace(gjson.GetBytes(payload, path).String())
-		if serviceTier != "" {
-			return serviceTier
+	// Single pass over the top-level object instead of three independent
+	// gjson.GetBytes scans. Each scan re-walks the whole body (including the
+	// large input/messages array) just to confirm a key is absent — the common
+	// case for codex traffic, where this helper showed up as a per-request CPU
+	// hotspot. Priority is preserved exactly: top-level service_tier first, then
+	// request.service_tier, then response.service_tier.
+	var top, reqTier, respTier string
+	gjson.ParseBytes(payload).ForEach(func(key, value gjson.Result) bool {
+		switch key.String() {
+		case "service_tier":
+			top = strings.TrimSpace(value.String())
+		case "request":
+			reqTier = strings.TrimSpace(value.Get("service_tier").String())
+		case "response":
+			respTier = strings.TrimSpace(value.Get("service_tier").String())
 		}
+		return true
+	})
+	if top != "" {
+		return top
+	}
+	if reqTier != "" {
+		return reqTier
+	}
+	if respTier != "" {
+		return respTier
 	}
 	return usage.DefaultServiceTier
 }
