@@ -294,3 +294,58 @@ func assertJSONEqual(t *testing.T, want, got []byte) {
 		t.Fatalf("JSON mismatch\nwant: %s\n got: %s", string(want), string(got))
 	}
 }
+
+// G002 differential (ACCURATE slow-path model): mirrors codex_executor.go:1027-1045
+// exactly — translate + ApplyThinking + ApplyPayloadConfig + finalize + the
+// whole-body sanitizeOpenAIResponsesReasoningEncryptedContent at line 1045 that the
+// real slow path applies (and that my earlier test wrongly omitted). Uses the real
+// production shape: thinking-suffix model + reasoning items carrying encrypted_content
+// + system role in the input array. If fast==slow here, the post-latest commits
+// (05f3cb2c/429749e7/a80c5d04) emit byte-identical upstream requests vs cbc1c3de.
+func TestG002PostLatestProducesSameUpstreamBytes(t *testing.T) {
+	cases := []struct{ name, model string }{
+		{"plain", "gpt-5-codex"},
+		{"suffix_high", "gpt-5-codex(high)"},
+		{"suffix_low", "gpt-5-codex(low)"},
+	}
+	raw := `{
+		"model":"gpt-5-codex",
+		"instructions":"You are Codex.",
+		"input":[
+			{"type":"message","role":"system","content":[{"type":"input_text","text":"sys"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"q1"}]},
+			{"type":"reasoning","summary":[{"type":"summary_text","text":"t"}],"encrypted_content":"INVALID_SIG_AAAA=="},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"a1"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"q2"}]}
+		],
+		"reasoning":{"effort":"medium","summary":"detailed"},
+		"tools":[{"type":"web_search_preview"}],
+		"service_tier":"priority",
+		"max_output_tokens":2048,
+		"previous_response_id":"resp_prev",
+		"stream":true
+	}`
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rawJSON := []byte(raw)
+			exec := NewCodexExecutor(&config.Config{})
+			req := cliproxyexecutor.Request{Model: tc.model, Payload: rawJSON}
+			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response"), OriginalRequest: rawJSON, Stream: true}
+			from := opts.SourceFormat
+			to := sdktranslator.FromString("codex")
+			baseModel := thinking.ParseSuffix(req.Model).ModelName
+			// FAST path (a80c5d04)
+			originalPayload, fastBody, ok, err := exec.prepareCodexResponsesRequestBodyFast(context.Background(), nil, req, opts, from, to, baseModel, codexStreamTrue, true, true)
+			if err != nil { t.Fatalf("fast err: %v", err) }
+			if !ok { t.Fatal("did not take fast path") }
+			// SLOW path (cbc1c3de) — exact mirror of codex_executor.go:1027-1045
+			originalTranslated, slowBody := translateCodexRequestPair(opts, from, to, baseModel, originalPayload, req.Payload, false)
+			slowBody, err = thinking.ApplyThinking(slowBody, req.Model, from.String(), to.String(), exec.Identifier())
+			if err != nil { t.Fatalf("ApplyThinking err: %v", err) }
+			slowBody = helps.ApplyPayloadConfigWithRequest(exec.cfg, baseModel, to.String(), from.String(), "", slowBody, originalTranslated, req.Model, "", opts.Headers)
+			slowBody = finalizeCodexRequestBody(slowBody, baseModel, codexStreamTrue, true, true, nil, "")
+			slowBody = sanitizeOpenAIResponsesReasoningEncryptedContent(context.Background(), "codex executor", slowBody)
+			assertJSONEqual(t, slowBody, fastBody)
+		})
+	}
+}
