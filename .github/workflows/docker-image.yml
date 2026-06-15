@@ -68,7 +68,9 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
+          # amd64-only: sonic JIT runs at full speed on amd64; arm64 dropped
+          # (sonic falls back to a slow compat path there). Simpler/faster builds.
+          platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
           build-args: |
             VERSION=${{ env.VERSION }}

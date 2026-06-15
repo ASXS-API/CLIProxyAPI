@@ -9,6 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/jsonx"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -258,4 +259,34 @@ func TestCodexIdentityConfuseKeepsClientBodySeparateFromUpstreamBody(t *testing.
 	if gotKey := gjson.GetBytes(clientBody, "prompt_cache_key").String(); gotKey != "cache-1" {
 		t.Fatalf("client prompt_cache_key = %q, want cache-1", gotKey)
 	}
+}
+
+func TestCodexCacheIDOpenAIResponsesFormatBothEngines(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		want    string
+	}{
+		{"key present", `{"prompt_cache_key":"my-cache-key"}`, "my-cache-key"},
+		{"key absent", `{"model":"gpt-5.4"}`, ""},
+		{"key empty string", `{"prompt_cache_key":""}`, ""},
+	}
+	executor := &CodexExecutor{}
+	for _, engine := range []string{"", "all"} {
+		label := "std"
+		if engine == "all" {
+			label = "sonic"
+		}
+		jsonx.Configure(engine)
+		for _, tc := range cases {
+			t.Run(label+"/"+tc.name, func(t *testing.T) {
+				req := cliproxyexecutor.Request{Payload: []byte(tc.payload)}
+				got := executor.codexCacheID(context.Background(), sdktranslator.FromString("openai-response"), req)
+				if got != tc.want {
+					t.Fatalf("[%s] codexCacheID(%s) = %q, want %q", label, tc.payload, got, tc.want)
+				}
+			})
+		}
+	}
+	jsonx.Configure("")
 }

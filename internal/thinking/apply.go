@@ -4,6 +4,7 @@ package thinking
 import (
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/jsonx"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -601,9 +602,12 @@ func extractOpenAIConfig(body []byte) ThinkingConfig {
 //
 // This is similar to OpenAI but uses nested field "reasoning.effort" instead of "reasoning_effort".
 func extractCodexConfig(body []byte) ThinkingConfig {
-	// Check reasoning.effort (Codex / OpenAI Responses API format)
-	if effort := gjson.GetBytes(body, "reasoning.effort"); effort.Exists() {
-		value := effort.String()
+	// Check reasoning.effort (Codex / OpenAI Responses API format).
+	// Routed through jsonx so the engine (gjson std vs sonic) is runtime-switchable.
+	// GetString returns "" for both absent and empty-string, which matches the
+	// original gjson.GetBytes(...).Exists() guard — an absent field and an
+	// explicit empty-string effort both fall through to ThinkingConfig{}.
+	if value := jsonx.GetString("read.thinking.codexeffort", body, "reasoning.effort"); value != "" {
 		if value == "none" {
 			return ThinkingConfig{Mode: ModeNone, Budget: 0}
 		}

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/jsonx"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
@@ -300,13 +301,23 @@ func TestExtractServiceTierFromPayloadPriorityAndNested(t *testing.T) {
 		{"absent with large input defaults", `{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":"hi"}]}`, usage.DefaultServiceTier},
 		{"empty payload defaults", ``, usage.DefaultServiceTier},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := extractServiceTierFromPayload([]byte(tc.payload)); got != tc.want {
-				t.Fatalf("extractServiceTierFromPayload(%s) = %q, want %q", tc.payload, got, tc.want)
-			}
-		})
+	// Run every case under BOTH engines (std gjson and sonic) — the migration
+	// parity guarantee for this read.
+	for _, engine := range []string{"", "all"} {
+		label := "std"
+		if engine == "all" {
+			label = "sonic"
+		}
+		jsonx.Configure(engine)
+		for _, tc := range cases {
+			t.Run(label+"/"+tc.name, func(t *testing.T) {
+				if got := extractServiceTierFromPayload([]byte(tc.payload)); got != tc.want {
+					t.Fatalf("[%s] extractServiceTierFromPayload(%s) = %q, want %q", label, tc.payload, got, tc.want)
+				}
+			})
+		}
 	}
+	jsonx.Configure("")
 }
 
 func TestUsageReporterBuildAdditionalModelRecordSkipsZeroTokens(t *testing.T) {

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/jsonx"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -296,32 +297,16 @@ func extractServiceTierFromPayload(payload []byte) string {
 	if len(payload) == 0 {
 		return usage.DefaultServiceTier
 	}
-	// Single pass over the top-level object instead of three independent
-	// gjson.GetBytes scans. Each scan re-walks the whole body (including the
-	// large input/messages array) just to confirm a key is absent — the common
-	// case for codex traffic, where this helper showed up as a per-request CPU
-	// hotspot. Priority is preserved exactly: top-level service_tier first, then
-	// request.service_tier, then response.service_tier.
-	var top, reqTier, respTier string
-	gjson.ParseBytes(payload).ForEach(func(key, value gjson.Result) bool {
-		switch key.String() {
-		case "service_tier":
-			top = strings.TrimSpace(value.String())
-		case "request":
-			reqTier = strings.TrimSpace(value.Get("service_tier").String())
-		case "response":
-			respTier = strings.TrimSpace(value.Get("service_tier").String())
+	// Routed through the jsonx façade so the engine (gjson std vs sonic) is
+	// runtime-switchable via the JSONX_SONIC toggle. Priority is preserved
+	// exactly: service_tier > request.service_tier > response.service_tier.
+	// The std path uses gjson.GetBytes (zero-copy — no whole-body string copy,
+	// unlike gjson.ParseBytes).
+	const comp = "read.servicetier"
+	for _, path := range []string{"service_tier", "request.service_tier", "response.service_tier"} {
+		if st := strings.TrimSpace(jsonx.GetString(comp, payload, path)); st != "" {
+			return st
 		}
-		return true
-	})
-	if top != "" {
-		return top
-	}
-	if reqTier != "" {
-		return reqTier
-	}
-	if respTier != "" {
-		return respTier
 	}
 	return usage.DefaultServiceTier
 }

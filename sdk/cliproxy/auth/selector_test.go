@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/jsonx"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
@@ -1464,4 +1465,32 @@ func TestSessionAffinitySelector_Concurrent(t *testing.T) {
 		t.Fatalf("concurrent Pick() error = %v", err)
 	default:
 	}
+}
+
+func TestExtractSessionIDsScalarReadsBothEngines(t *testing.T) {
+	cases := []struct {
+		name        string
+		payload     string
+		wantPrimary string
+	}{
+		{"metadata.user_id non-claude format", `{"metadata":{"user_id":"acct-42"}}`, "user:acct-42"},
+		{"conversation_id fallback", `{"conversation_id":"conv-abc"}`, "conv:conv-abc"},
+		{"metadata.user_id absent falls to conversation_id", `{"conversation_id":"conv-xyz"}`, "conv:conv-xyz"},
+	}
+	for _, engine := range []string{"", "all"} {
+		label := "std"
+		if engine == "all" {
+			label = "sonic"
+		}
+		jsonx.Configure(engine)
+		for _, tc := range cases {
+			t.Run(label+"/"+tc.name, func(t *testing.T) {
+				primary, _ := extractSessionIDs(nil, []byte(tc.payload), nil)
+				if primary != tc.wantPrimary {
+					t.Fatalf("[%s] extractSessionIDs(%s) primary = %q, want %q", label, tc.payload, primary, tc.wantPrimary)
+				}
+			})
+		}
+	}
+	jsonx.Configure("")
 }

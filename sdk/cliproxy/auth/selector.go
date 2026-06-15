@@ -18,6 +18,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/jsonx"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -715,7 +716,7 @@ func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]
 	var userID string
 	// 1. metadata.user_id with Claude Code session format (highest priority)
 	if len(payload) > 0 {
-		userID = gjson.GetBytes(payload, "metadata.user_id").String()
+		userID = jsonx.GetString("read.auth.sessionid", payload, "metadata.user_id")
 		if userID != "" {
 			// Old format: user_{hash}_account__session_{uuid}
 			if matches := sessionPattern.FindStringSubmatch(userID); len(matches) >= 2 {
@@ -775,7 +776,7 @@ func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]
 	}
 
 	// 7. conversation_id field
-	if convID := gjson.GetBytes(payload, "conversation_id").String(); convID != "" {
+	if convID := jsonx.GetString("read.auth.sessionid", payload, "conversation_id"); convID != "" {
 		return "conv:" + convID, ""
 	}
 
