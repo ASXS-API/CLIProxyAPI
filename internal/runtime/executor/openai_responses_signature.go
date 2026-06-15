@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/bytedance/sonic"
+	"github.com/bytedance/sonic/ast"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/jsonx"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
 	codexresponses "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/codex/openai/responses"
@@ -135,7 +138,7 @@ func codexReasoningEncryptedContentDropReason(item gjson.Result) string {
 // It is JSON-equivalent to applying codexresponses.RewriteCodexInputItemSystemRole
 // per item and then sanitizeReasoningEncryptedContentInput (the two transforms touch
 // disjoint fields — role vs encrypted_content — so they commute).
-func sanitizeAndRewriteCodexInput(ctx context.Context, provider string, inputRaw []byte) ([]byte, bool) {
+func sanitizeAndRewriteCodexInputStd(ctx context.Context, provider string, inputRaw []byte) ([]byte, bool) {
 	input := gjson.ParseBytes(inputRaw)
 	if !input.IsArray() {
 		return inputRaw, false
@@ -191,4 +194,113 @@ func sanitizeAndRewriteCodexInput(ctx context.Context, provider string, inputRaw
 	})
 	out.WriteByte(']')
 	return out.Bytes(), true
+}
+
+// sanitizeAndRewriteCodexInput dispatches between the std (gjson/sjson) and sonic
+// (ast) implementations per the JSONX_SONIC toggle (component "codex.req.sanitize").
+// Both are SEMANTICALLY equivalent — same system->developer role rewrite and same
+// invalid-reasoning-encrypted_content drop. sonic re-serializes the array, so its
+// bytes differ from std's surgical edit (verified by
+// TestSanitizeAndRewriteCodexInput_EngineParity, which asserts jsonx.SemanticEqual).
+func sanitizeAndRewriteCodexInput(ctx context.Context, provider string, inputRaw []byte) ([]byte, bool) {
+	if jsonx.UseSonic("codex.req.sanitize") {
+		return sanitizeAndRewriteCodexInputSonic(ctx, provider, inputRaw)
+	}
+	return sanitizeAndRewriteCodexInputStd(ctx, provider, inputRaw)
+}
+
+// sanitizeAndRewriteCodexInputSonic parses the input array once, mutates items in
+// place (role system->developer; drop invalid reasoning encrypted_content), and
+// re-serializes — replacing the std path's per-item gjson.Result copy + sjson.DeleteBytes
+// (each a full re-copy) + bytes.Buffer assembly with one parse + in-place edit + marshal.
+func sanitizeAndRewriteCodexInputSonic(ctx context.Context, provider string, inputRaw []byte) ([]byte, bool) {
+	root, err := sonic.Get(inputRaw)
+	if err != nil || root.TypeSafe() != ast.V_ARRAY {
+		return inputRaw, false
+	}
+	// sonic.Get returns a LAZY node: Len() reports 0 and children aren't
+	// materialized until accessed. Fully load before iterating/mutating.
+	if err := root.LoadAll(); err != nil {
+		return inputRaw, false
+	}
+	provider = strings.TrimSpace(provider)
+	if provider == "" {
+		provider = "openai responses upstream"
+	}
+	n, err := root.Len()
+	if err != nil {
+		return inputRaw, false
+	}
+	changed := false
+	for i := 0; i < n; i++ {
+		item := root.Index(i)
+		if item == nil || !item.Exists() {
+			continue
+		}
+		// role "system" -> "developer"
+		if roleNode := item.Get("role"); roleNode != nil && roleNode.Exists() {
+			if role, errRole := roleNode.String(); errRole == nil && role == "system" {
+				if _, errSet := item.SetAny("role", "developer"); errSet == nil {
+					changed = true
+				}
+			}
+		}
+		// drop invalid reasoning encrypted_content
+		if codexReasoningEncryptedContentShouldDropSonic(item) {
+			if _, errUnset := item.Unset("encrypted_content"); errUnset == nil {
+				changed = true
+				itemID := ""
+				if idNode := item.Get("id"); idNode != nil && idNode.Exists() {
+					if s, errID := idNode.String(); errID == nil {
+						itemID = strings.TrimSpace(s)
+					}
+				}
+				if itemID == "" {
+					itemID = fmt.Sprintf("input[%d]", i)
+				}
+				helps.LogWithRequestID(ctx).Debugf("%s: dropped invalid reasoning encrypted_content at input[%d] item_id=%q (sonic)", provider, i, itemID)
+			}
+		}
+	}
+	if !changed {
+		return inputRaw, false
+	}
+	out, err := root.MarshalJSON()
+	if err != nil {
+		return inputRaw, false
+	}
+	return out, true
+}
+
+// codexReasoningEncryptedContentShouldDropSonic mirrors the DROP DECISION of
+// codexReasoningEncryptedContentDropReason (the gjson version returns a reason string
+// used only for logging; here we only need the boolean). Drop a reasoning item's
+// encrypted_content when it is non-string (null/number/object/array), has surrounding
+// whitespace, or fails the cached GPT reasoning-signature inspection. Robust to sonic's
+// String() coercion: a coerced null/non-string never passes InspectGPTReasoningSignature,
+// so the decision matches std in every case.
+func codexReasoningEncryptedContentShouldDropSonic(item *ast.Node) bool {
+	typeNode := item.Get("type")
+	if typeNode == nil || !typeNode.Exists() {
+		return false
+	}
+	t, err := typeNode.String()
+	if err != nil || strings.TrimSpace(t) != "reasoning" {
+		return false
+	}
+	ec := item.Get("encrypted_content")
+	if ec == nil || !ec.Exists() {
+		return false
+	}
+	if ec.TypeSafe() != ast.V_STRING {
+		return true
+	}
+	raw, err := ec.String()
+	if err != nil {
+		return true
+	}
+	if raw != strings.TrimSpace(raw) {
+		return true
+	}
+	return signature.InspectGPTReasoningSignatureCached(raw) != nil
 }
