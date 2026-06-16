@@ -9,11 +9,17 @@ import (
 	"strings"
 	"unsafe"
 
+	"github.com/bytedance/sonic"
 	gojson "github.com/goccy/go-json"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/jsonx"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+// sonicNoEscape marshals WITHOUT HTML escaping, matching the verbatim fast path /
+// marshalJSONNoEscape semantics. Used when the codex.req.marshal component is on sonic.
+var sonicNoEscape = sonic.Config{EscapeHTML: false}.Froze()
 
 // CodexRequestObject is the top-level Responses request object after Codex compatibility rewrites.
 type CodexRequestObject = map[string]json.RawMessage
@@ -255,6 +261,18 @@ func MarshalCodexRequestObject(obj CodexRequestObject) ([]byte, error) {
 // MUST only use this when obj's values are known-valid JSON (the Codex fast path
 // guarantees this).
 func MarshalCodexRequestObjectFast(obj CodexRequestObject) ([]byte, error) {
+	if jsonx.UseSonic("codex.req.marshal") {
+		if len(obj) == 0 {
+			return []byte(`{}`), nil
+		}
+		// sonic re-serializes (incl. the input array), benchmark-neutral vs the
+		// verbatim path; JSON-equivalent (key order / value whitespace may differ).
+		return sonicNoEscape.Marshal(obj)
+	}
+	return marshalCodexRequestObjectFastVerbatim(obj)
+}
+
+func marshalCodexRequestObjectFastVerbatim(obj CodexRequestObject) ([]byte, error) {
 	if len(obj) == 0 {
 		return []byte(`{}`), nil
 	}
