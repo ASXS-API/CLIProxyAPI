@@ -174,6 +174,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err = e.ensureCodexAccountID(ctx, auth); err != nil {
+		return resp, err
+	}
 	if opts.Alt == "responses/compact" {
 		return e.CodexExecutor.executeCompact(ctx, auth, req, opts)
 	}
@@ -393,6 +396,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	log.Debugf("Executing Codex Websockets stream request with auth ID: %s, model: %s", auth.ID, req.Model)
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if err = e.ensureCodexAccountID(ctx, auth); err != nil {
+		return nil, err
 	}
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusBadRequest, msg: "streaming not supported for /responses/compact"}
@@ -894,12 +900,8 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 		headers.Set("Originator", codexOriginator)
 	}
 	if !isAPIKey {
-		if auth != nil && auth.Metadata != nil {
-			if accountID, ok := auth.Metadata["account_id"].(string); ok {
-				if trimmed := strings.TrimSpace(accountID); trimmed != "" {
-					setHeaderCasePreserved(headers, "ChatGPT-Account-ID", trimmed)
-				}
-			}
+		if accountID := codexResolvedAccountID(auth); accountID != "" {
+			setHeaderCasePreserved(headers, "ChatGPT-Account-ID", accountID)
 		}
 	}
 

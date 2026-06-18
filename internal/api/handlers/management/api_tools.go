@@ -579,6 +579,10 @@ func tokenValueFromMetadata(metadata map[string]any) string {
 	if v, ok := metadata["access_token"].(string); ok && strings.TrimSpace(v) != "" {
 		return strings.TrimSpace(v)
 	}
+	// Codex personal access tokens are opaque bearer tokens used directly.
+	if v, ok := metadata["personal_access_token"].(string); ok && strings.TrimSpace(v) != "" {
+		return strings.TrimSpace(v)
+	}
 	if tokenRaw, ok := metadata["token"]; ok && tokenRaw != nil {
 		switch typed := tokenRaw.(type) {
 		case string:

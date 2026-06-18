@@ -997,6 +997,9 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 }
 
 func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	if err = e.ensureCodexAccountID(ctx, auth); err != nil {
+		return resp, err
+	}
 	if opts.Alt == "responses/compact" {
 		return e.executeCompact(ctx, auth, req, opts)
 	}
@@ -1286,6 +1289,9 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 }
 
 func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	if err = e.ensureCodexAccountID(ctx, auth); err != nil {
+		return nil, err
+	}
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusBadRequest, msg: "streaming not supported for /responses/compact"}
 	}
@@ -1631,6 +1637,11 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 		}
 	}
 	if refreshToken == "" {
+		// Personal access tokens are not refreshed; instead re-resolve and persist
+		// the ChatGPT account id via whoami so it stays valid (and revoked tokens fail).
+		if err := e.refreshCodexPersonalAccessToken(ctx, auth); err != nil {
+			return nil, err
+		}
 		return auth, nil
 	}
 	svc := codexauth.NewCodexAuthWithProxyURL(e.cfg, helps.EffectiveProxyURL(e.cfg, auth))
@@ -1894,10 +1905,8 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 		r.Header.Set("Originator", codexOriginator)
 	}
 	if !isAPIKey {
-		if auth != nil && auth.Metadata != nil {
-			if accountID, ok := auth.Metadata["account_id"].(string); ok {
-				r.Header.Set("Chatgpt-Account-Id", accountID)
-			}
+		if accountID := codexResolvedAccountID(auth); accountID != "" {
+			r.Header.Set("Chatgpt-Account-Id", accountID)
 		}
 	}
 	var attrs map[string]string
@@ -2221,11 +2230,138 @@ func codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 		baseURL = a.Attributes["base_url"]
 	}
 	if apiKey == "" && a.Metadata != nil {
-		if v, ok := a.Metadata["access_token"].(string); ok {
+		if v, ok := a.Metadata["access_token"].(string); ok && strings.TrimSpace(v) != "" {
 			apiKey = v
+		}
+		// Fall back to a personal access token (opaque "at-" bearer) when no OAuth
+		// access token is present.
+		if strings.TrimSpace(apiKey) == "" {
+			if v, ok := a.Metadata["personal_access_token"].(string); ok {
+				apiKey = strings.TrimSpace(v)
+			}
 		}
 	}
 	return
+}
+
+// codexAccountIDMu serializes whoami lookups so concurrent first requests for the same
+// personal access token do not all hit the network.
+var codexAccountIDMu sync.Mutex
+
+// codexAccountIDCache caches resolved ChatGPT account ids keyed by the personal access
+// token. The id is cached here (rather than written into the shared auth.Metadata from
+// the request path) to avoid racing with credential cloning and scheduling reads.
+// Refresh persists the same account id onto the credential file out of band.
+var codexAccountIDCache sync.Map // map[string]string
+
+// codexAuthPersonalAccessToken returns the personal access token configured on auth, if
+// any. A personal access token is only used when no OAuth access token and no API key
+// are present.
+func codexAuthPersonalAccessToken(auth *cliproxyauth.Auth) string {
+	if auth == nil || auth.Metadata == nil {
+		return ""
+	}
+	if auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != "" {
+		return ""
+	}
+	if accessToken, _ := auth.Metadata["access_token"].(string); strings.TrimSpace(accessToken) != "" {
+		return ""
+	}
+	pat, _ := auth.Metadata["personal_access_token"].(string)
+	pat = strings.TrimSpace(pat)
+	if !codexauth.IsPersonalAccessToken(pat) {
+		return ""
+	}
+	return pat
+}
+
+// codexResolvedAccountID returns the ChatGPT account id for auth, preferring the value
+// persisted on the credential metadata and falling back to the personal access token
+// cache populated by ensureCodexAccountID. It performs only map reads and is safe to
+// call from the request path.
+func codexResolvedAccountID(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Metadata != nil {
+		if accountID, _ := auth.Metadata["account_id"].(string); strings.TrimSpace(accountID) != "" {
+			return strings.TrimSpace(accountID)
+		}
+	}
+	if pat := codexAuthPersonalAccessToken(auth); pat != "" {
+		if v, ok := codexAccountIDCache.Load(pat); ok {
+			if accountID, ok2 := v.(string); ok2 {
+				return accountID
+			}
+		}
+	}
+	return ""
+}
+
+// ensureCodexAccountID makes sure a personal access token credential has its ChatGPT
+// account id resolved before a request is issued. Personal access tokens (prefix "at-")
+// are opaque bearer tokens that carry no embedded account information, so the account id
+// is fetched from the whoami endpoint on first use and cached. OAuth and API-key
+// credentials, and credentials whose account id is already known, are left untouched.
+func (e *CodexExecutor) ensureCodexAccountID(ctx context.Context, auth *cliproxyauth.Auth) error {
+	if auth == nil {
+		return nil
+	}
+	if auth.Metadata != nil {
+		if accountID, _ := auth.Metadata["account_id"].(string); strings.TrimSpace(accountID) != "" {
+			return nil
+		}
+	}
+	pat := codexAuthPersonalAccessToken(auth)
+	if pat == "" {
+		return nil
+	}
+	if _, ok := codexAccountIDCache.Load(pat); ok {
+		return nil
+	}
+
+	codexAccountIDMu.Lock()
+	defer codexAccountIDMu.Unlock()
+	if _, ok := codexAccountIDCache.Load(pat); ok {
+		return nil
+	}
+	svc := codexauth.NewCodexAuthWithProxyURL(e.cfg, helps.EffectiveProxyURL(e.cfg, auth))
+	meta, err := svc.WhoamiPersonalAccessToken(ctx, pat)
+	if err != nil {
+		return err
+	}
+	codexAccountIDCache.Store(pat, meta.ChatgptAccountID)
+	return nil
+}
+
+// refreshCodexPersonalAccessToken re-resolves and persists the account metadata for a
+// personal access token credential. It is invoked from Refresh on a cloned auth, so it
+// re-validates the token unconditionally (whoami fails for revoked tokens) and updates
+// last_refresh. Non-PAT credentials are ignored.
+func (e *CodexExecutor) refreshCodexPersonalAccessToken(ctx context.Context, auth *cliproxyauth.Auth) error {
+	if auth == nil || auth.Metadata == nil {
+		return nil
+	}
+	pat, _ := auth.Metadata["personal_access_token"].(string)
+	pat = strings.TrimSpace(pat)
+	if pat == "" {
+		return nil
+	}
+	svc := codexauth.NewCodexAuthWithProxyURL(e.cfg, helps.EffectiveProxyURL(e.cfg, auth))
+	meta, err := svc.WhoamiPersonalAccessToken(ctx, pat)
+	if err != nil {
+		return err
+	}
+	auth.Metadata["account_id"] = meta.ChatgptAccountID
+	if strings.TrimSpace(meta.Email) != "" {
+		auth.Metadata["email"] = meta.Email
+	}
+	if strings.TrimSpace(meta.ChatgptPlanType) != "" {
+		auth.Metadata["plan_type"] = meta.ChatgptPlanType
+	}
+	auth.Metadata["type"] = "codex"
+	auth.Metadata["last_refresh"] = time.Now().Format(time.RFC3339)
+	return nil
 }
 
 func (e *CodexExecutor) resolveCodexConfig(auth *cliproxyauth.Auth) *config.CodexKey {
