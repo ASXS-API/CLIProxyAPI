@@ -2544,6 +2544,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			} else {
 				clearAuthStateOnSuccess(auth, now)
 			}
+		} else if reason := fatalCredentialErrorReason(result.Error); reason != "" {
+			disableAuthForFatalError(auth, result.Error, reason, now)
 		} else {
 			if result.Model != "" {
 				if !isRequestScopedNotFoundResultError(result.Error) {
@@ -3148,6 +3150,60 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			auth.StatusMessage = "request failed"
 		}
 	}
+}
+
+// fatalCredentialErrorReason inspects an upstream failure body and returns a
+// short reason when the error indicates the credential is permanently unusable
+// (e.g. a revoked personal access token or an inactive token owner). Such
+// credentials are disabled outright instead of being placed on a temporary
+// cooldown, because retrying them only produces more upstream failures.
+//
+// Matching is deliberately narrow so transient, refreshable auth failures (for
+// example codex "invalid or expired token", which normalizes to the same
+// auth_unavailable code) are NOT treated as fatal.
+func fatalCredentialErrorReason(resultErr *Error) string {
+	if resultErr == nil {
+		return ""
+	}
+	lower := strings.ToLower(resultErr.Message)
+	switch {
+	case strings.Contains(lower, "biscuit_baker_service_auth_credential_error_status"),
+		strings.Contains(lower, "personal access token owner is inactive"):
+		return "personal access token owner is inactive"
+	case strings.Contains(lower, "auth_unavailable") &&
+		strings.Contains(lower, "authentication_error") &&
+		strings.Contains(lower, "unauthorized"):
+		return "unauthorized"
+	default:
+		return ""
+	}
+}
+
+// disableAuthForFatalError marks a credential as permanently disabled so it is
+// removed from rotation and persisted as disabled across restarts. Re-enabling
+// requires operator action (management API or editing the auth file).
+func disableAuthForFatalError(auth *Auth, resultErr *Error, reason string, now time.Time) {
+	if auth == nil {
+		return
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "credential disabled after fatal upstream error"
+	}
+	auth.Disabled = true
+	auth.Unavailable = true
+	auth.Status = StatusDisabled
+	auth.StatusMessage = reason
+	auth.NextRetryAfter = time.Time{}
+	auth.UpdatedAt = now
+	if resultErr != nil {
+		auth.LastError = cloneError(resultErr)
+	}
+	log.WithFields(log.Fields{
+		"auth_id":  auth.ID,
+		"provider": auth.Provider,
+		"label":    auth.Label,
+		"reason":   reason,
+	}).Warn("auth credential auto-disabled after fatal upstream error")
 }
 
 // nextQuotaCooldown returns the next cooldown duration and updated backoff level for repeated quota errors.
