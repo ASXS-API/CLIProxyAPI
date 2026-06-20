@@ -43,6 +43,16 @@ func TestFatalCredentialErrorReason(t *testing.T) {
 			err:        &Error{Message: `{"error":{"message":"rate limit","type":"rate_limit_error","code":"rate_limited"}}`},
 			wantReason: "",
 		},
+		{
+			name:       "self-serve business usage-based limit is fatal",
+			err:        &Error{Message: `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"self_serve_business_usage_based","resets_at":1784390329,"eligible_promo":null,"resets_in_seconds":2429922}}`},
+			wantReason: "usage limit reached (self-serve business usage-based plan)",
+		},
+		{
+			name:       "usage_limit_reached without business plan stays on cooldown",
+			err:        &Error{Message: `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"claude_pro","resets_in_seconds":3600}}`},
+			wantReason: "",
+		},
 	}
 
 	for _, tc := range tests {

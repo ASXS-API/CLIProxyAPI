@@ -3174,6 +3174,14 @@ func fatalCredentialErrorReason(resultErr *Error) string {
 		strings.Contains(lower, "authentication_error") &&
 		strings.Contains(lower, "unauthorized"):
 		return "unauthorized"
+	case strings.Contains(lower, "usage_limit_reached") &&
+		strings.Contains(lower, "self_serve_business_usage_based"):
+		// A usage-based business plan that reports usage_limit_reached has
+		// exhausted its account-level spend, not a refreshable rate limit, so a
+		// temporary cooldown would just keep replaying the same failure. Disable
+		// the credential outright instead. Plain usage_limit_reached errors on
+		// other plan types remain on the quota cooldown path.
+		return "usage limit reached (self-serve business usage-based plan)"
 	default:
 		return ""
 	}
