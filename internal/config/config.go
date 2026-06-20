@@ -247,7 +247,11 @@ type QuotaExceeded struct {
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
-	// Supported values: "round-robin" (default), "fill-first".
+	// Supported values: "round-robin" (default), "fill-first",
+	// "fill-first-oldest". "fill-first" burns the lowest-ID available
+	// credential first; "fill-first-oldest" burns the oldest (earliest to join
+	// the pool) available credential first, so newly added credentials queue at
+	// the back and never preempt the one currently in use.
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
 
 	// SessionAffinity enables universal session-sticky routing for all clients.

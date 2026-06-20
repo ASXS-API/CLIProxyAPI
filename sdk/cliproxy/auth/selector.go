@@ -36,6 +36,35 @@ type RoundRobinSelector struct {
 // rolling-window subscription caps (e.g. chat message limits).
 type FillFirstSelector struct{}
 
+// FillFirstOldestSelector is a fill-first variant that always serves the
+// oldest credential first, where "oldest" means the order in which credentials
+// first entered the pool rather than their ID. A credential is burned until it
+// becomes unavailable (cooldown/disabled) before the next-oldest is used;
+// newly added credentials join the back of the line and never preempt one that
+// is already in use. This is the "fix one credential, burn it to death" policy.
+//
+// Plain FillFirstSelector orders by ID, so a freshly added credential whose ID
+// sorts earlier hijacks traffic from the credential currently being burned,
+// polluting both. FillFirstOldestSelector avoids that by capturing join order
+// the first time it observes an auth ID and assigning a strictly increasing
+// sequence number. Sorting available auths by that sequence yields a stable,
+// fixed serving order across requests that is immune to config reloads and
+// auth-file rewrites (which reset on-disk timestamps).
+//
+// The sequence is process-local: after a restart the initial pool is re-seeded
+// in ID order (deterministic), and credentials added later still queue at the
+// back. The map of seen IDs is capped; on overflow it resets, which re-seeds
+// the live pool in ID order one time.
+type FillFirstOldestSelector struct {
+	mu      sync.Mutex
+	seq     map[string]int64
+	nextSeq int64
+}
+
+// fillFirstOldestMaxSeen bounds the first-seen registry so a long-running
+// process with heavy credential churn cannot grow it without limit.
+const fillFirstOldestMaxSeen = 65536
+
 type blockReason int
 
 const (
@@ -367,6 +396,65 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 	return available[0], nil
+}
+
+// Pick selects the oldest available auth (earliest to enter the pool), burning
+// it until it becomes unavailable before advancing to the next-oldest.
+func (s *FillFirstOldestSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	_ = opts
+	now := time.Now()
+	available, err := getAvailableAuths(auths, provider, model, now)
+	if err != nil {
+		return nil, err
+	}
+	available = preferCodexWebsocketAuths(ctx, provider, available)
+	s.sortByJoinOrder(available)
+	return available[0], nil
+}
+
+// sortByJoinOrder reorders available in place by each auth's first-seen
+// sequence (oldest first). Auths observed for the first time are assigned the
+// next sequence number; within a single batch they are seeded in ID order so
+// the initial pool has a deterministic order.
+func (s *FillFirstOldestSelector) sortByJoinOrder(available []*Auth) {
+	if len(available) == 0 {
+		return
+	}
+	s.mu.Lock()
+	if s.seq == nil {
+		s.seq = make(map[string]int64)
+	}
+	if len(s.seq) >= fillFirstOldestMaxSeen {
+		// Registry overflow: reset and re-seed the live pool below.
+		s.seq = make(map[string]int64)
+		s.nextSeq = 0
+	}
+	unseen := make([]*Auth, 0)
+	for _, a := range available {
+		if _, ok := s.seq[a.ID]; !ok {
+			unseen = append(unseen, a)
+		}
+	}
+	if len(unseen) > 1 {
+		sort.Slice(unseen, func(i, j int) bool { return unseen[i].ID < unseen[j].ID })
+	}
+	for _, a := range unseen {
+		s.seq[a.ID] = s.nextSeq
+		s.nextSeq++
+	}
+	order := make(map[string]int64, len(available))
+	for _, a := range available {
+		order[a.ID] = s.seq[a.ID]
+	}
+	s.mu.Unlock()
+
+	sort.Slice(available, func(i, j int) bool {
+		oi, oj := order[available[i].ID], order[available[j].ID]
+		if oi != oj {
+			return oi < oj
+		}
+		return available[i].ID < available[j].ID
+	})
 }
 
 func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
