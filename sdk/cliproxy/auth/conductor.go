@@ -3048,6 +3048,18 @@ func isRequestInvalidError(err error) bool {
 	if isModelSupportError(err) {
 		return false
 	}
+	// Some upstream request-shape failures carry an unambiguous OpenAI-style
+	// error code or message but an unreliable or absent HTTP status, so the
+	// status switch below would miss them and wrongly rotate to another
+	// credential. Switching auths cannot fix a malformed request (a missing,
+	// invalid, or unsupported parameter), so treat these signatures as
+	// request-invalid regardless of status.
+	lowerMsg := strings.ToLower(err.Error())
+	if strings.Contains(lowerMsg, "missing_required_parameter") ||
+		strings.Contains(lowerMsg, "invalid_value") ||
+		strings.Contains(lowerMsg, "unsupported parameter") {
+		return true
+	}
 	status := statusCodeFromError(err)
 	switch status {
 	case http.StatusBadRequest:
