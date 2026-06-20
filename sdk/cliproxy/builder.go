@@ -225,6 +225,8 @@ func (b *Builder) Build() (*Service, error) {
 		switch strategy {
 		case "fill-first", "fillfirst", "ff":
 			selector = &coreauth.FillFirstSelector{}
+		case "fill-first-oldest", "fillfirstoldest", "oldest-first", "ffo":
+			selector = &coreauth.FillFirstOldestSelector{}
 		default:
 			selector = &coreauth.RoundRobinSelector{}
 		}

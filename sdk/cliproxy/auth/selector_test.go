@@ -125,6 +125,91 @@ func TestFillFirstSelectorPick_PriorityFallbackCooldown(t *testing.T) {
 	}
 }
 
+func TestFillFirstOldestSelectorPick_SeedsInitialPoolByID(t *testing.T) {
+	t.Parallel()
+
+	selector := &FillFirstOldestSelector{}
+	auths := []*Auth{
+		{ID: "b"},
+		{ID: "a"},
+		{ID: "c"},
+	}
+
+	// Initial pool with no observed join order is seeded in ID order, so the
+	// lowest ID is served first (and keeps being served while it stays live).
+	for i := 0; i < 3; i++ {
+		got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick() #%d error = %v", i, err)
+		}
+		if got.ID != "a" {
+			t.Fatalf("Pick() #%d auth.ID = %q, want %q", i, got.ID, "a")
+		}
+	}
+}
+
+func TestFillFirstOldestSelectorPick_NewCredentialDoesNotPreempt(t *testing.T) {
+	t.Parallel()
+
+	selector := &FillFirstOldestSelector{}
+
+	// Burn credential "m" first (it is the only one in the pool initially).
+	initial := []*Auth{{ID: "m"}}
+	got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, initial)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got.ID != "m" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "m")
+	}
+
+	// A new credential "a" appears whose ID sorts BEFORE "m". Plain fill-first
+	// would hijack traffic onto "a"; fill-first-oldest must keep serving "m"
+	// because "a" joined later and queues at the back.
+	withNew := []*Auth{{ID: "a"}, {ID: "m"}}
+	for i := 0; i < 3; i++ {
+		got, err = selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, withNew)
+		if err != nil {
+			t.Fatalf("Pick() after new credential #%d error = %v", i, err)
+		}
+		if got.ID != "m" {
+			t.Fatalf("Pick() after new credential #%d auth.ID = %q, want %q (must not preempt)", i, got.ID, "m")
+		}
+	}
+}
+
+func TestFillFirstOldestSelectorPick_AdvancesWhenOldestCoolsDown(t *testing.T) {
+	t.Parallel()
+
+	selector := &FillFirstOldestSelector{}
+	now := time.Now()
+	model := "test-model"
+
+	oldest := &Auth{
+		ID: "m",
+		ModelStates: map[string]*ModelState{
+			model: {
+				Status:         StatusActive,
+				Unavailable:    true,
+				NextRetryAfter: now.Add(30 * time.Minute),
+				Quota:          QuotaState{Exceeded: true},
+			},
+		},
+	}
+	newer := &Auth{ID: "a"} // sorts before "m" by ID, but joined the pool later
+
+	// Seed join order: observe both while oldest is still notionally first.
+	// "m" is cooling down, so the next-oldest available ("a") must take over
+	// rather than erroring or sticking on the dead credential.
+	got, err := selector.Pick(context.Background(), "mixed", model, cliproxyexecutor.Options{}, []*Auth{oldest, newer})
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got.ID != "a" {
+		t.Fatalf("Pick() auth.ID = %q, want %q (advance past cooled-down oldest)", got.ID, "a")
+	}
+}
+
 func TestRoundRobinSelectorPick_Concurrent(t *testing.T) {
 	selector := &RoundRobinSelector{}
 	auths := []*Auth{
