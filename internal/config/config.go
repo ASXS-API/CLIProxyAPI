@@ -77,6 +77,10 @@ type Config struct {
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
+	// FatalCredentialErrors toggles which upstream error signatures permanently
+	// disable a credential (instead of applying a temporary cooldown).
+	FatalCredentialErrors FatalCredentialErrorsConfig `yaml:"fatal-credential-errors" json:"fatal-credential-errors"`
+
 	// AuthAutoRefreshWorkers overrides the size of the core auth auto-refresh worker pool.
 	// When <= 0, the default worker count is used.
 	AuthAutoRefreshWorkers int `yaml:"auth-auto-refresh-workers" json:"auth-auto-refresh-workers"`
@@ -242,6 +246,43 @@ type QuotaExceeded struct {
 	// When all free-tier auths are exhausted (429/503), the conductor retries with
 	// an auth that has available Google One AI credits.
 	AntigravityCredits bool `yaml:"antigravity-credits" json:"antigravity-credits"`
+}
+
+// FatalCredentialErrorsConfig controls which upstream error signatures cause a
+// credential to be permanently disabled (kicked out of rotation and persisted as
+// disabled) instead of being placed on a temporary, auto-recovering cooldown.
+//
+// Each rule defaults to enabled. The fields are pointers so that an absent key in
+// the YAML (nil) preserves the historical behavior of disabling the credential;
+// set a field to false to keep the credential on the normal cooldown path.
+type FatalCredentialErrorsConfig struct {
+	// InactiveTokenOwner controls rule #1: messages containing
+	// "biscuit_baker_service_auth_credential_error_status" or
+	// "personal access token owner is inactive".
+	InactiveTokenOwner *bool `yaml:"inactive-token-owner,omitempty" json:"inactive-token-owner,omitempty"`
+
+	// Unauthorized controls rule #2: messages containing all of
+	// "auth_unavailable", "authentication_error", and "unauthorized".
+	Unauthorized *bool `yaml:"unauthorized,omitempty" json:"unauthorized,omitempty"`
+
+	// UsageLimit controls rule #3: messages containing both
+	// "usage_limit_reached" and "self_serve_business_usage_based".
+	UsageLimit *bool `yaml:"usage-limit,omitempty" json:"usage-limit,omitempty"`
+}
+
+// InactiveTokenOwnerEnabled reports whether fatal rule #1 is active (default true).
+func (f FatalCredentialErrorsConfig) InactiveTokenOwnerEnabled() bool {
+	return f.InactiveTokenOwner == nil || *f.InactiveTokenOwner
+}
+
+// UnauthorizedEnabled reports whether fatal rule #2 is active (default true).
+func (f FatalCredentialErrorsConfig) UnauthorizedEnabled() bool {
+	return f.Unauthorized == nil || *f.Unauthorized
+}
+
+// UsageLimitEnabled reports whether fatal rule #3 is active (default true).
+func (f FatalCredentialErrorsConfig) UsageLimitEnabled() bool {
+	return f.UsageLimit == nil || *f.UsageLimit
 }
 
 // RoutingConfig configures how credentials are selected for requests.

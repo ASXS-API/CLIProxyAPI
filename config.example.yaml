@@ -119,6 +119,18 @@ upstream-response-header-timeout:
 # When true, disable auth/model cooldown scheduling globally (prevents blackout windows after failure states).
 disable-cooling: false
 
+# fatal-credential-errors toggles which "fatal" upstream errors permanently disable a
+# credential (kick it out of rotation, persist it as disabled, require manual recovery)
+# instead of applying a temporary, auto-recovering cooldown. Each rule defaults to true;
+# set a rule to false to keep the matching failures on the normal cooldown path.
+fatal-credential-errors:
+  # Rule #1: "biscuit_baker_service_auth_credential_error_status" / "personal access token owner is inactive".
+  inactive-token-owner: true
+  # Rule #2: messages containing auth_unavailable + authentication_error + unauthorized.
+  unauthorized: true
+  # Rule #3: usage_limit_reached + self_serve_business_usage_based (account-level spend exhausted).
+  usage-limit: true
+
 # disable-image-generation supports: false (default), true, or "chat".
 # - true: disable image_generation everywhere (also returns 404 for /v1/images/generations and /v1/images/edits).
 # - "chat": disable image_generation injection on non-images endpoints, but keep /v1/images/generations and /v1/images/edits enabled.

@@ -276,6 +276,11 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 	managementasset.SetCurrentConfig(cfg)
 	auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
+	auth.SetFatalCredentialRulesEnabled(
+		cfg.FatalCredentialErrors.InactiveTokenOwnerEnabled(),
+		cfg.FatalCredentialErrors.UnauthorizedEnabled(),
+		cfg.FatalCredentialErrors.UsageLimitEnabled(),
+	)
 	applySignatureCacheConfig(nil, cfg)
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
@@ -1407,6 +1412,12 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	if oldCfg == nil || oldCfg.DisableCooling != cfg.DisableCooling {
 		auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
 	}
+
+	auth.SetFatalCredentialRulesEnabled(
+		cfg.FatalCredentialErrors.InactiveTokenOwnerEnabled(),
+		cfg.FatalCredentialErrors.UnauthorizedEnabled(),
+		cfg.FatalCredentialErrors.UsageLimitEnabled(),
+	)
 
 	if oldCfg != nil && oldCfg.DisableImageGeneration != cfg.DisableImageGeneration {
 		log.Infof("disable-image-generation updated: %v -> %v", oldCfg.DisableImageGeneration, cfg.DisableImageGeneration)

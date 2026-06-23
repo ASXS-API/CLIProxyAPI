@@ -487,6 +487,11 @@ func main() {
 	redisqueue.SetUsageStatisticsEnabled(cfg.UsageStatisticsEnabled)
 	redisqueue.SetRetentionSeconds(cfg.RedisUsageQueueRetentionSeconds)
 	coreauth.SetQuotaCooldownDisabled(cfg.DisableCooling)
+	coreauth.SetFatalCredentialRulesEnabled(
+		cfg.FatalCredentialErrors.InactiveTokenOwnerEnabled(),
+		cfg.FatalCredentialErrors.UnauthorizedEnabled(),
+		cfg.FatalCredentialErrors.UsageLimitEnabled(),
+	)
 
 	if err = logging.ConfigureLogOutput(cfg); err != nil {
 		log.Errorf("failed to configure log output: %v", err)

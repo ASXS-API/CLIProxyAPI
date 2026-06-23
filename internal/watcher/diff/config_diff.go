@@ -45,6 +45,15 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.DisableCooling != newCfg.DisableCooling {
 		changes = append(changes, fmt.Sprintf("disable-cooling: %t -> %t", oldCfg.DisableCooling, newCfg.DisableCooling))
 	}
+	if oldCfg.FatalCredentialErrors.InactiveTokenOwnerEnabled() != newCfg.FatalCredentialErrors.InactiveTokenOwnerEnabled() {
+		changes = append(changes, fmt.Sprintf("fatal-credential-errors.inactive-token-owner: %t -> %t", oldCfg.FatalCredentialErrors.InactiveTokenOwnerEnabled(), newCfg.FatalCredentialErrors.InactiveTokenOwnerEnabled()))
+	}
+	if oldCfg.FatalCredentialErrors.UnauthorizedEnabled() != newCfg.FatalCredentialErrors.UnauthorizedEnabled() {
+		changes = append(changes, fmt.Sprintf("fatal-credential-errors.unauthorized: %t -> %t", oldCfg.FatalCredentialErrors.UnauthorizedEnabled(), newCfg.FatalCredentialErrors.UnauthorizedEnabled()))
+	}
+	if oldCfg.FatalCredentialErrors.UsageLimitEnabled() != newCfg.FatalCredentialErrors.UsageLimitEnabled() {
+		changes = append(changes, fmt.Sprintf("fatal-credential-errors.usage-limit: %t -> %t", oldCfg.FatalCredentialErrors.UsageLimitEnabled(), newCfg.FatalCredentialErrors.UsageLimitEnabled()))
+	}
 	if oldCfg.DisableImageGeneration != newCfg.DisableImageGeneration {
 		changes = append(changes, fmt.Sprintf("disable-image-generation: %v -> %v", oldCfg.DisableImageGeneration, newCfg.DisableImageGeneration))
 	}

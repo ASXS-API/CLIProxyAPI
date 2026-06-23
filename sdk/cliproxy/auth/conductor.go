@@ -91,6 +91,29 @@ func SetQuotaCooldownDisabled(disable bool) {
 	quotaCooldownDisabled.Store(disable)
 }
 
+// Fatal credential error rule toggles. Each defaults to enabled so the historical
+// behavior (auto-disable the credential) is preserved unless explicitly turned off.
+var (
+	fatalRuleInactiveOwnerEnabled atomic.Bool
+	fatalRuleUnauthorizedEnabled  atomic.Bool
+	fatalRuleUsageLimitEnabled    atomic.Bool
+)
+
+func init() {
+	fatalRuleInactiveOwnerEnabled.Store(true)
+	fatalRuleUnauthorizedEnabled.Store(true)
+	fatalRuleUsageLimitEnabled.Store(true)
+}
+
+// SetFatalCredentialRulesEnabled toggles which fatal credential error rules are
+// active. A disabled rule lets the matching failure fall through to the normal
+// temporary cooldown path instead of permanently disabling the credential.
+func SetFatalCredentialRulesEnabled(inactiveOwner, unauthorized, usageLimit bool) {
+	fatalRuleInactiveOwnerEnabled.Store(inactiveOwner)
+	fatalRuleUnauthorizedEnabled.Store(unauthorized)
+	fatalRuleUsageLimitEnabled.Store(usageLimit)
+}
+
 func quotaCooldownDisabledForAuth(auth *Auth) bool {
 	if auth != nil {
 		if override, ok := auth.DisableCoolingOverride(); ok {
@@ -3179,14 +3202,17 @@ func fatalCredentialErrorReason(resultErr *Error) string {
 	}
 	lower := strings.ToLower(resultErr.Message)
 	switch {
-	case strings.Contains(lower, "biscuit_baker_service_auth_credential_error_status"),
-		strings.Contains(lower, "personal access token owner is inactive"):
+	case fatalRuleInactiveOwnerEnabled.Load() &&
+		(strings.Contains(lower, "biscuit_baker_service_auth_credential_error_status") ||
+			strings.Contains(lower, "personal access token owner is inactive")):
 		return "personal access token owner is inactive"
-	case strings.Contains(lower, "auth_unavailable") &&
+	case fatalRuleUnauthorizedEnabled.Load() &&
+		strings.Contains(lower, "auth_unavailable") &&
 		strings.Contains(lower, "authentication_error") &&
 		strings.Contains(lower, "unauthorized"):
 		return "unauthorized"
-	case strings.Contains(lower, "usage_limit_reached") &&
+	case fatalRuleUsageLimitEnabled.Load() &&
+		strings.Contains(lower, "usage_limit_reached") &&
 		strings.Contains(lower, "self_serve_business_usage_based"):
 		// A usage-based business plan that reports usage_limit_reached has
 		// exhausted its account-level spend, not a refreshable rate limit, so a

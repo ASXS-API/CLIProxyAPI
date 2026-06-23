@@ -64,6 +64,36 @@ func TestFatalCredentialErrorReason(t *testing.T) {
 	}
 }
 
+func TestFatalCredentialErrorReason_RuleToggles(t *testing.T) {
+	// Not parallel: mutates global rule toggles.
+	inactiveOwnerErr := &Error{Message: `Personal access token owner is inactive.`}
+	unauthorizedErr := &Error{Message: `{"error":{"message":"Unauthorized","type":"authentication_error","code":"auth_unavailable"}}`}
+	usageLimitErr := &Error{Message: `{"error":{"type":"usage_limit_reached","plan_type":"self_serve_business_usage_based"}}`}
+
+	// Restore defaults after the test.
+	t.Cleanup(func() { SetFatalCredentialRulesEnabled(true, true, true) })
+
+	// All disabled: every fatal signature falls through to the cooldown path.
+	SetFatalCredentialRulesEnabled(false, false, false)
+	for _, err := range []*Error{inactiveOwnerErr, unauthorizedErr, usageLimitErr} {
+		if got := fatalCredentialErrorReason(err); got != "" {
+			t.Fatalf("rules disabled: fatalCredentialErrorReason = %q, want empty", got)
+		}
+	}
+
+	// Selectively enable only the unauthorized rule.
+	SetFatalCredentialRulesEnabled(false, true, false)
+	if got := fatalCredentialErrorReason(inactiveOwnerErr); got != "" {
+		t.Fatalf("inactive-owner disabled: got %q, want empty", got)
+	}
+	if got := fatalCredentialErrorReason(unauthorizedErr); got != "unauthorized" {
+		t.Fatalf("unauthorized enabled: got %q, want %q", got, "unauthorized")
+	}
+	if got := fatalCredentialErrorReason(usageLimitErr); got != "" {
+		t.Fatalf("usage-limit disabled: got %q, want empty", got)
+	}
+}
+
 func TestDisableAuthForFatalError(t *testing.T) {
 	t.Parallel()
 
